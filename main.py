@@ -1,14 +1,15 @@
-# main.py － Emobot+ FastAPI（完整覆蓋版，含媒合記錄CSV，EXPORT_DIR 可由環境變數覆寫）
+# main.py — Emobot+ FastAPI（Postgres 版，CSV 以 API 匯出，不寫本地檔）
 import os
+import io
+import csv
 import json
 import re
-import csv
-from pathlib import Path
 from datetime import datetime, timedelta
 from typing import List, Optional, Any, Dict, Tuple
 
 from fastapi import FastAPI, Depends, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
@@ -19,36 +20,32 @@ from sqlalchemy import (
 from sqlalchemy.orm import (
     DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker, Session
 )
-from filelock import FileLock  # 檔案鎖，安全寫 CSV
 
 # -------------------------
 # 環境變數
 # -------------------------
 load_dotenv(override=True)
 
-PORT = int(os.getenv("PORT", "8000"))
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./emobot.db")
 
 # 支援多個前端網域（逗號分隔）
 _frontend = os.getenv("FRONTEND_URL", "*")
 ALLOWED_ORIGINS = [o.strip() for o in _frontend.split(",")] if _frontend else ["*"]
 
-# -------------------------
-# 檔案與資料夾（CSV）— 支援永久磁碟
-# -------------------------
-BASE_DIR = Path(__file__).resolve().parent
-# 可用環境變數覆寫（例如在 Render 設 EXPORT_DIR=/var/data/exports）
-EXPORT_DIR = Path(os.getenv("EXPORT_DIR", str(BASE_DIR / "exports")))
-EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+def _normalize_db_url(url: str) -> str:
+    """把 postgres:// 轉成 postgresql+psycopg2:// 並預設 sslmode=require（雲端 DB 常用）"""
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql+psycopg2://", 1)
+    if url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
+    if url.startswith("postgresql+psycopg2://") and "sslmode=" not in url:
+        # 非本機則強制 SSL
+        if ("localhost" not in url) and ("127.0.0.1" not in url):
+            sep = "&" if "?" in url else "?"
+            url = f"{url}{sep}sslmode=require"
+    return url
 
-# 填答匯出
-CSV_PATH = EXPORT_DIR / "assessments.csv"
-CSV_LOCK = EXPORT_DIR / "assessments.csv.lock"
-
-# 媒合推薦匯出
-MATCH_CSV_PATH = EXPORT_DIR / "match_recommendations.csv"
-MATCH_CSV_LOCK = EXPORT_DIR / "match_recommendations.csv.lock"
+DATABASE_URL = _normalize_db_url(os.getenv("DATABASE_URL", "sqlite:///./emobot.db"))
 
 # -------------------------
 # 資料庫
@@ -202,11 +199,15 @@ class UpsertAssessmentRequest(BaseModel):
     submittedAt: Optional[datetime] = None
 
 # -------------------------
-# 根路由（顯示 DB 路徑方便你確認）
+# 根路由（顯示 DB 提要方便確認）
 # -------------------------
 @app.get("/")
 def root():
-    return {"ok": True, "name": "Emobot+ API (FastAPI)", "db": DATABASE_URL, "exports": str(EXPORT_DIR)}
+    return {
+        "ok": True,
+        "name": "Emobot+ API (FastAPI)",
+        "db": DATABASE_URL.split("://", 1)[0] + "://***",
+    }
 
 # -------------------------
 # Auth：暱稱＋受試者ID（兩碼數字＋兩碼英文）
@@ -259,43 +260,7 @@ def _assessment_to_out(a: Optional[Assessment]) -> Optional[Dict[str, Any]]:
     }
 
 # -------------------------
-# 工具：CSV（填答）
-# -------------------------
-def _csv_headers():
-    return [
-        "submittedAt", "userId", "pid", "nickname",
-        "mbti_raw", "mbti_encoded",
-        "step2Answers", "step3Answers", "step4Answers",
-        "createdAt", "updatedAt",
-    ]
-
-def _ensure_csv_header():
-    if not CSV_PATH.exists():
-        with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(_csv_headers())
-
-def _append_csv_row(a: Assessment, user: User):
-    def loads(s): 
-        return json.loads(s) if s else None
-
-    row = [
-        a.submitted_at.isoformat() if a.submitted_at else "",
-        user.id, user.pid, user.nickname,
-        a.mbti_raw or "",
-        a.mbti_encoded or "",
-        json.dumps(loads(a.step2_answers) or [], ensure_ascii=False),
-        json.dumps(loads(a.step3_answers) or [], ensure_ascii=False),
-        json.dumps(loads(a.step4_answers) or [], ensure_ascii=False),
-        a.created_at.isoformat() if a.created_at else "",
-        a.updated_at.isoformat() if a.updated_at else "",
-    ]
-    with FileLock(str(CSV_LOCK), timeout=10):
-        _ensure_csv_header()
-        with open(CSV_PATH, "a", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(row)
-
-# -------------------------
-# 作答 upsert（分步；完成時自動寫 CSV）
+# 作答 upsert（分步；不再寫本地 CSV）
 # -------------------------
 @app.post("/api/assessments/upsert")
 def upsert_assessment(
@@ -323,14 +288,6 @@ def upsert_assessment(
 
     db.commit()
     db.refresh(a)
-
-    # 只有完成（帶 submittedAt）才寫入 CSV
-    if payload.submittedAt is not None:
-        try:
-            _append_csv_row(a, user)
-        except Exception as ex:
-            print("[CSV] export failed:", ex)
-
     return {"ok": True, "data": _assessment_to_out(a)}
 
 # -------------------------
@@ -367,33 +324,42 @@ def list_assessments(
     }
 
 # -------------------------
-# （可選）重新匯出整份 CSV（需 admin）
+# 匯出 CSV（後台）— 即時產生，不落地
 # -------------------------
-@app.post("/api/admin/assessments/export-csv")
+@app.get("/api/admin/assessments/export-csv")
 def export_csv_all(_: User = Depends(admin_required), db: Session = Depends(get_db)):
     rows = db.scalars(select(Assessment)).all()
-    with FileLock(str(CSV_LOCK), timeout=10):
-        with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(_csv_headers())
-            for a in rows:
-                user = db.get(User, a.user_id)
-                if not user:
-                    continue
-                def loads(s): 
-                    return json.loads(s) if s else None
-                writer.writerow([
-                    a.submitted_at.isoformat() if a.submitted_at else "",
-                    user.id, user.pid, user.nickname,
-                    a.mbti_raw or "",
-                    a.mbti_encoded or "",
-                    json.dumps(loads(a.step2_answers) or [], ensure_ascii=False),
-                    json.dumps(loads(a.step3_answers) or [], ensure_ascii=False),
-                    json.dumps(loads(a.step4_answers) or [], ensure_ascii=False),
-                    a.created_at.isoformat() if a.created_at else "",
-                    a.updated_at.isoformat() if a.updated_at else "",
-                ])
-    return {"ok": True, "path": str(CSV_PATH)}
+
+    def loads(s): 
+        return json.loads(s) if s else None
+
+    sio = io.StringIO()
+    writer = csv.writer(sio)
+    writer.writerow([
+        "submittedAt","userId","pid","nickname",
+        "mbti_raw","mbti_encoded",
+        "step2Answers","step3Answers","step4Answers",
+        "createdAt","updatedAt",
+    ])
+    for a in rows:
+        user = db.get(User, a.user_id)
+        if not user: 
+            continue
+        writer.writerow([
+            a.submitted_at.isoformat() if a.submitted_at else "",
+            user.id, user.pid, user.nickname,
+            a.mbti_raw or "",
+            a.mbti_encoded or "",
+            json.dumps(loads(a.step2_answers) or [], ensure_ascii=False),
+            json.dumps(loads(a.step3_answers) or [], ensure_ascii=False),
+            json.dumps(loads(a.step4_answers) or [], ensure_ascii=False),
+            a.created_at.isoformat() if a.created_at else "",
+            a.updated_at.isoformat() if a.updated_at else "",
+        ])
+
+    sio.seek(0)
+    headers = {"Content-Disposition": 'attachment; filename="assessments.csv"'}
+    return StreamingResponse(iter([sio.getvalue()]), media_type="text/csv", headers=headers)
 
 # =========================================================
 # =====           媒合演算法（四型分數）              =====
@@ -436,10 +402,9 @@ PROTOTYPES: Dict[str, Dict[str, float]] = {
 }
 
 # --- Step2 次量表的題目索引（0-based）。若未知可留空，退回整體平均 ---
-ATTACH_ANXIETY_IDX: List[int] = []   # e.g., [1,3,6,7,12,18,20]
-ATTACH_AVOID_IDX:   List[int] = []   # e.g., [0,8,10,11,14,16,21]
+ATTACH_ANXIETY_IDX: List[int] = []
+ATTACH_AVOID_IDX:   List[int] = []
 
-# ===== 特徵工程與打分 =====
 def _safe_avg(nums: List[Optional[float]]) -> Optional[float]:
     vv = [x for x in nums if x is not None]
     return sum(vv)/len(vv) if vv else None
@@ -464,7 +429,6 @@ def _cosine(a: Dict[str, float], b: Dict[str, float], weights: Dict[str, float])
     return num / ((da ** 0.5) * (db ** 0.5))
 
 def compute_features(assessment: dict) -> Dict[str, Optional[float]]:
-    """把 Assessment 轉為 0~1 特徵；缺就回 None。"""
     mbti = assessment.get("mbti") or {}
     enc  = mbti.get("encoded") or [None, None, None, None]
     E, N, T, P = enc + [None]*(4-len(enc))
@@ -499,7 +463,6 @@ def compute_features(assessment: dict) -> Dict[str, Optional[float]]:
     return features
 
 def score_bots(features: Dict[str, Optional[float]]) -> Tuple[Dict[str, float], Dict[str, List[Tuple[str, float]]]]:
-    """回傳：各 bot 分數(0-100) 與特徵貢獻（前2項）。"""
     scores: Dict[str, float] = {}
     top_feats: Dict[str, List[Tuple[str, float]]] = {}
 
@@ -564,38 +527,18 @@ def match_recommend(user: User = Depends(auth_required), db: Session = Depends(g
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
     return {
-        "features": feats,  # 若不想回傳可拿掉
+        "features": feats,
         "scores": scores,
         "ranked": [{"type": k, "name": names.get(k, k), "score": v, "why": explain.get(k, "")} for k, v in ranked]
     }
 
-# ---- 儲存推薦結果（DB + CSV） ----
+# ---- 儲存推薦結果（只寫 DB，不寫檔） ----
 @app.post("/api/match/log")
 def match_log(payload: Dict[str, Any], user: User = Depends(auth_required), db: Session = Depends(get_db)):
     rec = MatchRecLog(user_id=user.id, ranked_json=json.dumps(payload, ensure_ascii=False))
     db.add(rec)
     db.commit()
     db.refresh(rec)
-    # 寫CSV摘要
-    try:
-        ranked = payload.get("ranked") or []
-        topType = ranked[0]["type"] if ranked else ""
-        topScore = ranked[0]["score"] if ranked else ""
-        row = [
-            rec.created_at.isoformat(),
-            user.id, user.pid, user.nickname,
-            topType, topScore,
-            json.dumps(ranked, ensure_ascii=False),
-        ]
-        with FileLock(str(MATCH_CSV_LOCK), timeout=10):
-            if not MATCH_CSV_PATH.exists():
-                with open(MATCH_CSV_PATH, "w", newline="", encoding="utf-8") as f:
-                    csv.writer(f).writerow(["createdAt","userId","pid","nickname","topType","topScore","rankedJson"])
-            with open(MATCH_CSV_PATH, "a", newline="", encoding="utf-8") as f:
-                csv.writer(f).writerow(row)
-    except Exception as ex:
-        print("[CSV] match log export failed:", ex)
-
     return {"ok": True, "loggedAt": rec.created_at.isoformat()}
 
 # ---- 使用者選擇 ----
@@ -622,15 +565,37 @@ def match_me(user: User = Depends(auth_required), db: Session = Depends(get_db))
     rec = db.scalar(select(MatchChoice).where(MatchChoice.user_id == user.id))
     return {"choice": {"botType": rec.bot_type, "chosenAt": rec.created_at.isoformat()}} if rec else {"choice": None}
 
+# ---- 匯出推薦紀錄 CSV（後台）
+@app.get("/api/admin/match-logs/export-csv")
+def export_match_log(_: User = Depends(admin_required), db: Session = Depends(get_db)):
+    logs = db.scalars(select(MatchRecLog).order_by(MatchRecLog.created_at.desc())).all()
+    sio = io.StringIO()
+    w = csv.writer(sio)
+    w.writerow(["createdAt","userId","pid","nickname","topType","topScore","rankedJson"])
+    for row in logs:
+        user = db.get(User, row.user_id)
+        ranked = []
+        top_type = ""; top_score = ""
+        try:
+            ranked = json.loads(row.ranked_json).get("ranked") or []
+            if ranked:
+                top_type = ranked[0].get("type", "")
+                top_score = ranked[0].get("score", "")
+        except Exception:
+            pass
+        w.writerow([
+            row.created_at.isoformat(),
+            user.id if user else "", user.pid if user else "", user.nickname if user else "",
+            top_type, top_score,
+            json.dumps(ranked, ensure_ascii=False),
+        ])
+    sio.seek(0)
+    headers = {"Content-Disposition": 'attachment; filename="match_recommendations.csv"'}
+    return StreamingResponse(iter([sio.getvalue()]), media_type="text/csv", headers=headers)
+
 # -------------------------
-# 啟動方式（命令列）：
-# python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
-# 在 Render：
+# 啟動（Render）
 # Build: pip install -r requirements.txt
 # Start: uvicorn main:app --host 0.0.0.0 --port $PORT
-# 並設定：
-# DATABASE_URL=sqlite:////var/data/emobot.db
-# EXPORT_DIR=/var/data/exports
-# FRONTEND_URL=https://你的前端.vercel.app, http://localhost:3000
-# JWT_SECRET=（長隨機字串）
+# 環境變數：DATABASE_URL（Postgres）、FRONTEND_URL、JWT_SECRET、PYTHON_VERSION=3.12.5
 # -------------------------
