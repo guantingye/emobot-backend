@@ -1,7 +1,7 @@
+# app/db/base.py
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy import MetaData
 
-# 為了未來更換 DB 或做 migration 比較安全
 metadata_obj = MetaData(
     naming_convention={
         "ix": "ix_%(column_0_label)s",

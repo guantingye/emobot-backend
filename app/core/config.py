@@ -1,16 +1,15 @@
-from pydantic import Field
-from pydantic_settings import BaseSettings
+# app/core/config.py
+from dotenv import load_dotenv, find_dotenv
+load_dotenv(find_dotenv())
 
-class Settings(BaseSettings):
-    # 後端部署請用環境變數設定，勿把敏感資訊寫死
-    DATABASE_URL: str = Field(..., description="PostgreSQL URL")
-    JWT_SECRET: str = Field(..., description="JWT secret for signing tokens")
-    JWT_EXPIRE_MINUTES: int = 60 * 24 * 30  # 30天
-    # 允許的前端網域（逗號分隔）
-    ALLOWED_ORIGINS: str = "https://emobot-plus.vercel.app,http://localhost:3000,http://localhost:5173"
-
-    class Config:
-        env_file = ".env"
-        extra = "ignore"
-
+import os
+class Settings:
+    JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
+    JWT_ALG = os.getenv("JWT_ALG", "HS256")
+    JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "129600"))
+    DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./app.db")
+    ALLOWED_ORIGINS = os.getenv(
+        "ALLOWED_ORIGINS",
+        "https://emobot-plus.vercel.app,http://localhost:5173,http://localhost:3000",
+    )
 settings = Settings()

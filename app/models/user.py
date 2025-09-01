@@ -1,5 +1,6 @@
-from sqlalchemy import String, Integer, DateTime
+# app/models/user.py
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy import Integer, String, DateTime
 from datetime import datetime
 from app.db.base import Base
 
@@ -7,11 +8,11 @@ class User(Base):
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    pid: Mapped[str] = mapped_column(String(32), unique=True, index=True)  # 你的自訂會員ID，如 12AB
-    nickname: Mapped[str] = mapped_column(String(64))
-    selected_bot: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(default=datetime.utcnow, onupdate=datetime.utcnow)
+    pid: Mapped[str] = mapped_column(String, unique=True, index=True)
+    nickname: Mapped[str | None] = mapped_column(String, nullable=True)
+    selected_bot: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     assessments = relationship("Assessment", back_populates="user")
     chat_messages = relationship("ChatMessage", back_populates="user")
