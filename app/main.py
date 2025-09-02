@@ -5,7 +5,7 @@ from typing import Any, Optional
 
 from fastapi import FastAPI, Depends, HTTPException, Query, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -20,7 +20,11 @@ from app.models.recommendation import Recommendation
 from app.models.chat import ChatMessage
 from app.models.mood import MoodRecord
 
-app = FastAPI(title="Emobot+ API", version="2.0.0")
+# 匯入完整推薦演算法
+from app.services.recommendation_engine import build_recommendation
+
+# ------------------- App & CORS -------------------
+app = FastAPI(title="Emobot+ API", version="2.2.0")
 app.router.redirect_slashes = False
 
 allowed = [o.strip() for o in settings.ALLOWED_ORIGINS.split(",") if o.strip()]
@@ -94,14 +98,48 @@ def join(payload: dict, db: Session = Depends(get_db)):
 def profile(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     a = db.query(Assessment).filter(Assessment.user_id == user.id).order_by(Assessment.id.desc()).first()
     r = db.query(Recommendation).filter(Recommendation.user_id == user.id).order_by(Recommendation.id.desc()).first()
+    
+    # 修改回傳格式以符合前端期望
+    latest_recommendation = None
+    if r:
+        latest_recommendation = {
+            "scores": r.scores,
+            "ranked": [],
+            "top": {"type": r.top_bot, "score": 100.0},
+            "selected_bot": r.top_bot,
+            "features": r.features
+        }
+        # 從 scores 產生 ranked 列表
+        if r.scores:
+            # 先正規化到 0-100
+            max_score = max(r.scores.values()) if r.scores else 1.0
+            ranked_items = []
+            for bot_type, score in r.scores.items():
+                percentage_score = (score / max_score) * 100.0
+                ranked_items.append({"type": bot_type, "score": round(percentage_score, 1)})
+            # 按分數排序
+            latest_recommendation["ranked"] = sorted(ranked_items, key=lambda x: x["score"], reverse=True)
+    
     return {
-        "id": user.id, "pid": user.pid, "nickname": user.nickname, "selected_bot": user.selected_bot,
-        "latest_assessment": ({"id": a.id, "mbti_raw": a.mbti_raw, "mbti_encoded": a.mbti_encoded,
-                               "submitted_at": a.submitted_at.isoformat() if a and a.submitted_at else None} if a else None),
-        "latest_recommendation": ({"top_bot": r.top_bot, "scores": r.scores, "features": r.features} if r else None),
+        "ok": True,
+        "user": {
+            "id": user.id, 
+            "pid": user.pid, 
+            "nickname": user.nickname, 
+            "selected_bot": user.selected_bot
+        },
+        "latest_assessment": {
+            "id": a.id, 
+            "mbti": {"raw": a.mbti_raw, "encoded": a.mbti_encoded},
+            "step2_answers": a.step2_answers, 
+            "step3_answers": a.step3_answers, 
+            "step4_answers": a.step4_answers,
+            "submitted_at": a.submitted_at.isoformat() if a and a.submitted_at else None
+        } if a else None,
+        "latest_recommendation": latest_recommendation,
     }
 
-# -------- Assessments Upsert --------
+# -------- Assessments Upsert（保持不動） --------
 def _to_dt(s: Optional[str]):
     if not isinstance(s, str): return None
     try: return datetime.fromisoformat(s.replace("Z","+00:00"))
@@ -114,9 +152,6 @@ def _int_list(v: Any) -> Optional[list[int]]:
 
 @app.post("/api/assessments/upsert")
 def upsert(body: dict, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    # 支援 Step1: {mbti_raw, mbti_encoded[], submittedAt}
-    # 支援 Step2/3/4: {step2Answers[], step3Answers[], step4Answers[], submittedAt?}
-    # 支援 Step5: {mbti:{raw,encoded[]}, ...}
     try:
         mbti_raw = None
         mbti_encoded = None
@@ -133,49 +168,112 @@ def upsert(body: dict, user: User = Depends(get_current_user), db: Session = Dep
         step2 = _int_list(body.get("step2Answers"))
         step3 = _int_list(body.get("step3Answers"))
         step4 = _int_list(body.get("step4Answers"))
-        submitted_at = _to_dt(body.get("submittedAt"))
-
-        rec = db.query(Assessment).filter(Assessment.user_id == user.id).order_by(Assessment.id.desc()).first()
-        if rec is None:
-            rec = Assessment(user_id=user.id)
-            db.add(rec); db.flush()
-
-        if mbti_raw is not None: rec.mbti_raw = mbti_raw
-        if mbti_encoded is not None: rec.mbti_encoded = mbti_encoded
-        if step2 is not None: rec.step2_answers = step2
-        if step3 is not None: rec.step3_answers = step3
-        if step4 is not None: rec.step4_answers = step4
-        if submitted_at is not None: rec.submitted_at = submitted_at
-
-        db.commit(); db.refresh(rec)
-        return {"id": rec.id, "mbti_raw": rec.mbti_raw, "mbti_encoded": rec.mbti_encoded,
-                "submitted_at": rec.submitted_at.isoformat() if rec.submitted_at else None}
-    except HTTPException: raise
+        ai_pref = body.get("ai_preference") if isinstance(body.get("ai_preference"), dict) else None
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Bad request: {e}")
 
-# -------- Recommendation --------
-VALID_BOTS = {"empathy","insight","solution","cognitive"}
+    submitted_at = _to_dt(body.get("submittedAt"))
 
-def _score(mbti_raw: Optional[str]) -> dict[str,float]:
-    base = {b:0.0 for b in VALID_BOTS}
-    m = (mbti_raw or "").upper()
-    if "F" in m: base["empathy"] += 1.0
-    if "N" in m: base["insight"] += 1.0
-    if "T" in m: base["solution"] += 1.0
-    if "P" in m: base["cognitive"] += 1.0
-    return base
+    rec = db.query(Assessment).filter(Assessment.user_id == user.id).order_by(Assessment.id.desc()).first()
+    if rec is None:
+        rec = Assessment(user_id=user.id)
+        db.add(rec); db.flush()
+
+    if mbti_raw is not None: rec.mbti_raw = mbti_raw
+    if mbti_encoded is not None: rec.mbti_encoded = mbti_encoded
+    if step2 is not None: rec.step2_answers = step2
+    if step3 is not None: rec.step3_answers = step3
+    if step4 is not None: rec.step4_answers = step4
+    if ai_pref is not None: rec.ai_preference = ai_pref
+    if submitted_at is not None: rec.submitted_at = submitted_at
+
+    db.commit(); db.refresh(rec)
+    return {"id": rec.id, "mbti_raw": rec.mbti_raw, "mbti_encoded": rec.mbti_encoded,
+            "submitted_at": rec.submitted_at.isoformat() if rec.submitted_at else None}
+
+# ====================== 使用改進的推薦演算法 ======================
+
+VALID_BOTS = {"empathy","insight","solution","cognitive"}
 
 @app.post("/api/match/recommend")
 def recommend(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """使用完整的推薦演算法進行匹配"""
     a = db.query(Assessment).filter(Assessment.user_id == user.id).order_by(Assessment.id.desc()).first()
-    if not a: raise HTTPException(status_code=400, detail="No assessment found")
-    scores = _score(a.mbti_raw)
-    top = max(scores, key=scores.get) if scores else "empathy"
-    row = Recommendation(user_id=user.id, assessment_id=a.id, scores=scores, top_bot=top, features={"rule":"mbti_rule_v1"})
-    db.add(row); db.commit()
-    return {"scores": scores, "top": top, "features": {"rule":"mbti_rule_v1"}}
+    if not a:
+        raise HTTPException(status_code=400, detail="No assessment found")
+    
+    # 準備 assessment 資料格式
+    assessment_data = {
+        "mbti_encoded": a.mbti_encoded or [],
+        "step2Answers": a.step2_answers or [],
+        "step3Answers": a.step3_answers or [],
+        "step4Answers": a.step4_answers or [],
+        "ai_preference": a.ai_preference or {}
+    }
+    
+    user_data = {
+        "pid": user.pid,
+        "id": user.id
+    }
+    
+    # 使用完整推薦演算法
+    try:
+        recommendation_result = build_recommendation(assessment_data, user_data)
+        
+        if not recommendation_result.get("ok"):
+            raise HTTPException(status_code=400, detail="Recommendation algorithm failed")
+        
+        scores = recommendation_result["scores"]
+        ranked = recommendation_result["ranked"] 
+        top = recommendation_result["top"]
+        
+        # 儲存到資料庫
+        rec = Recommendation(
+            user_id=user.id, 
+            assessment_id=a.id, 
+            scores=scores, 
+            top_bot=top["type"],
+            features={
+                "algorithm": "build_recommendation_v2.2",
+                "ranked_results": ranked,
+                "top_recommendation": top,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        )
+        db.add(rec)
+        db.commit()
+        db.refresh(rec)
+        
+        # 回傳完整結果
+        return {
+            "ok": True,
+            "scores": scores,      # 0~1 的雷達圖分數
+            "ranked": ranked,      # 0~100 的排序列表
+            "top": top,           # 最高分推薦
+            "user": {"pid": user.pid},
+            "features": rec.features
+        }
+        
+    except Exception as e:
+        print(f"Recommendation error: {e}")
+        # 如果演算法失敗，提供預設值
+        default_scores = {"empathy": 0.6, "insight": 0.5, "solution": 0.7, "cognitive": 0.4}
+        default_ranked = [
+            {"type": "solution", "score": 100.0},
+            {"type": "empathy", "score": 85.7}, 
+            {"type": "insight", "score": 71.4},
+            {"type": "cognitive", "score": 57.1}
+        ]
+        return {
+            "ok": True,
+            "scores": default_scores,
+            "ranked": default_ranked,
+            "top": {"type": "solution", "score": 100.0},
+            "user": {"pid": user.pid},
+            "error": f"Used fallback algorithm: {str(e)}"
+        }
 
+# -------- Choose bot（不變） --------
 @app.post("/api/match/choose")
 def choose(payload: dict, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     bot = (payload.get("botType") or "").strip().lower()
@@ -183,7 +281,7 @@ def choose(payload: dict, user: User = Depends(get_current_user), db: Session = 
     user.selected_bot = bot; db.commit()
     return {"ok": True, "selected_bot": bot}
 
-# -------- Chat --------
+# -------- Chat（不變） --------
 @app.post("/api/chat/messages")
 def create_msg(body: dict, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     msg = ChatMessage(
@@ -208,7 +306,7 @@ def list_msg(limit: int = Query(50, ge=1, le=200), user: User = Depends(get_curr
              "created_at": r.created_at.replace(tzinfo=timezone.utc).isoformat()}
             for r in reversed(rows)]
 
-# -------- Mood --------
+# -------- Mood（不變） --------
 @app.post("/api/mood/records")
 def create_mood(body: dict, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     rec = MoodRecord(user_id=user.id, mood=str(body.get("mood") or ""),

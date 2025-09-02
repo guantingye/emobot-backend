@@ -10,12 +10,12 @@ class ChatMessage(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
 
-    message_type: Mapped[str] = mapped_column(String(8))  # 'user' / 'bot'
-    bot_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    message_type: Mapped[str] = mapped_column(String(10), default="user")
+    bot_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
     content: Mapped[str] = mapped_column(Text)
-
-    user_mood: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    user_mood: Mapped[str | None] = mapped_column(String(20), nullable=True)
     mood_intensity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     user = relationship("User", back_populates="chat_messages")

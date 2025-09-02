@@ -1,6 +1,7 @@
-from datetime import datetime
+# app/models/mood.py
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy import Integer, DateTime, ForeignKey, String, Text
+from datetime import datetime
 from app.db.base import Base
 
 class MoodRecord(Base):
@@ -9,7 +10,7 @@ class MoodRecord(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
 
-    mood: Mapped[str] = mapped_column(String(32))
+    mood: Mapped[str] = mapped_column(String(50))
     intensity: Mapped[int | None] = mapped_column(Integer, nullable=True)
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
 
