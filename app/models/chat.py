@@ -1,21 +1,20 @@
 # app/models/chat.py
-from sqlalchemy.orm import Mapped, mapped_column, relationship
-from sqlalchemy import Integer, DateTime, ForeignKey, String, Text
+# -*- coding: utf-8 -*-
 from datetime import datetime
+from sqlalchemy import Column, Integer, String, DateTime, Text, JSON
+
+# ✅ 正確路徑：Base 在 app/db/base.py
 from app.db.base import Base
+
 
 class ChatMessage(Base):
     __tablename__ = "chat_messages"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
-
-    message_type: Mapped[str] = mapped_column(String(10), default="user")
-    bot_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
-    content: Mapped[str] = mapped_column(Text)
-    user_mood: Mapped[str | None] = mapped_column(String(20), nullable=True)
-    mood_intensity: Mapped[int | None] = mapped_column(Integer, nullable=True)
-
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-
-    user = relationship("User", back_populates="chat_messages")
+    id         = Column(Integer, primary_key=True, index=True)
+    user_id    = Column(Integer, index=True, nullable=False)
+    bot_type   = Column(String(32), nullable=False)      # empathy / insight / solution / cognitive
+    mode       = Column(String(16), default="text")      # text / video
+    role       = Column(String(16), nullable=False)      # user / ai
+    content    = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    meta       = Column(JSON, nullable=True)

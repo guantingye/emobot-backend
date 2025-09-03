@@ -5,3 +5,4 @@ psycopg2-binary>=2.9.9
 python-jose[cryptography]>=3.3.0
 pydantic>=2.7.0
 python-dotenv>=1.0.1
+openai>=1.40.0
