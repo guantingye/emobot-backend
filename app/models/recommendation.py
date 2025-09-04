@@ -1,22 +1,29 @@
 # app/models/recommendation.py
-from sqlalchemy.orm import Mapped, mapped_column, relationship
-from sqlalchemy import Integer, DateTime, ForeignKey, String
-from sqlalchemy.dialects.postgresql import JSONB
-from datetime import datetime
+from sqlalchemy import Column, Integer, String, JSON, DateTime, ForeignKey, func
+from sqlalchemy.orm import relationship
 from app.db.base import Base
 
 class Recommendation(Base):
     __tablename__ = "recommendations"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
-    assessment_id: Mapped[int] = mapped_column(ForeignKey("assessments.id"), index=True)
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(
+        Integer, 
+        ForeignKey("users.id", ondelete="CASCADE"), 
+        nullable=True,  # 你的資料庫允許 NULL
+        index=True
+    )
+    assessment_id = Column(
+        Integer,
+        ForeignKey("assessments.id", ondelete="SET NULL"),
+        nullable=True
+    )
 
-    scores: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    top_bot: Mapped[str | None] = mapped_column(String(20), nullable=True)
-    features: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    selected_bot = Column(String, nullable=True)  # 你的資料庫已有此欄位
+    scores = Column(JSON, nullable=True)
+    features = Column(JSON, nullable=True)
+    ranked = Column(JSON, nullable=True)  # 新增的欄位
 
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
-    user = relationship("User", back_populates="recommendations")
-    assessment = relationship("Assessment", back_populates="recommendations")
+    user = relationship("User", back_populates="recommendations", lazy="select")

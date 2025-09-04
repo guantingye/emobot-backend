@@ -1,19 +1,22 @@
 # app/models/mood.py
-from sqlalchemy.orm import Mapped, mapped_column, relationship
-from sqlalchemy import Integer, DateTime, ForeignKey, String, Text
-from datetime import datetime
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, func
+from sqlalchemy.orm import relationship
 from app.db.base import Base
 
 class MoodRecord(Base):
     __tablename__ = "mood_records"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(
+        Integer, 
+        ForeignKey("users.id", ondelete="CASCADE"), 
+        nullable=True,  # 你的資料庫允許 NULL
+        index=True
+    )
 
-    mood: Mapped[str] = mapped_column(String(50))
-    intensity: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    mood = Column(String, nullable=False)
+    intensity = Column(Integer, nullable=True)
+    note = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-
-    user = relationship("User", back_populates="mood_records")
+    user = relationship("User", back_populates="moods", lazy="select")

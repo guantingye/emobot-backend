@@ -1,20 +1,44 @@
 # app/models/user.py
-from sqlalchemy.orm import Mapped, mapped_column, relationship
-from sqlalchemy import Integer, DateTime, String
-from datetime import datetime
+from sqlalchemy import Column, Integer, String, DateTime, func
+from sqlalchemy.orm import relationship
 from app.db.base import Base
 
 class User(Base):
     __tablename__ = "users"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    pid: Mapped[str] = mapped_column(String(50), unique=True, index=True)
-    nickname: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    selected_bot: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    id = Column(Integer, primary_key=True, index=True)
+    pid = Column(String, unique=True, index=True, nullable=False)
+    nickname = Column(String, nullable=True)
+    selected_bot = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now())
 
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-
-    assessments = relationship("Assessment", back_populates="user")
-    recommendations = relationship("Recommendation", back_populates="user")
-    chat_messages = relationship("ChatMessage", back_populates="user")
-    mood_records = relationship("MoodRecord", back_populates="user")
+    # 關聯設定
+    chat_messages = relationship(
+        "ChatMessage",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        lazy="select"
+    )
+    assessments = relationship(
+        "Assessment",
+        back_populates="user",
+        cascade="all, delete-orphan", 
+        passive_deletes=True,
+        lazy="select"
+    )
+    recommendations = relationship(
+        "Recommendation",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        lazy="select"
+    )
+    moods = relationship(
+        "MoodRecord", 
+        back_populates="user",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        lazy="select"
+    )

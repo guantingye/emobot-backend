@@ -1,26 +1,28 @@
 # app/models/assessment.py
-from sqlalchemy.orm import Mapped, mapped_column, relationship
-from sqlalchemy import Integer, DateTime, ForeignKey, String
-from sqlalchemy.dialects.postgresql import JSONB
-from datetime import datetime
+from sqlalchemy import Column, Integer, String, JSON, DateTime, ForeignKey, func
+from sqlalchemy.orm import relationship
 from app.db.base import Base
 
 class Assessment(Base):
     __tablename__ = "assessments"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(
+        Integer, 
+        ForeignKey("users.id", ondelete="CASCADE"), 
+        nullable=True,  # 你的資料庫允許 NULL
+        index=True
+    )
 
-    mbti_raw: Mapped[str | None] = mapped_column(String(8), nullable=True)
-    mbti_encoded: Mapped[list | dict | None] = mapped_column(JSONB, nullable=True)
+    mbti_raw = Column(String, nullable=True)
+    mbti_encoded = Column(JSON, nullable=True)
+    step2_answers = Column(JSON, nullable=True)
+    step3_answers = Column(JSON, nullable=True)
+    step4_answers = Column(JSON, nullable=True)
+    ai_preference = Column(JSON, nullable=True)
+    submitted_at = Column(DateTime(timezone=True), nullable=True)
 
-    step2_answers: Mapped[list | None] = mapped_column(JSONB, nullable=True)
-    step3_answers: Mapped[list | None] = mapped_column(JSONB, nullable=True)
-    step4_answers: Mapped[list | None] = mapped_column(JSONB, nullable=True)
-    ai_preference: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now())
 
-    submitted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-
-    user = relationship("User", back_populates="assessments")
-    recommendations = relationship("Recommendation", back_populates="assessment")
+    user = relationship("User", back_populates="assessments", lazy="select")
