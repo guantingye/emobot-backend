@@ -1,700 +1,480 @@
-# app/main.py
-from __future__ import annotations
-
+# app/main.py - 增強版，支援完整用戶流程
 import os
 import re
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
-from fastapi import FastAPI, Depends, HTTPException, Query, Request, Response
+from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
-
+from pydantic import BaseModel, Field, validator
 from sqlalchemy import text, and_
 from sqlalchemy.orm import Session
 
-# ---- App internals (沿用你原架構) ----
+# Core imports
 from app.core.config import settings
 from app.core.security import create_access_token, get_current_user
 from app.db.session import get_db, engine
 from app.db.base import Base
 
+# Models
 from app.models.user import User
-from app.models.assessment import Assessment
+from app.models.assessment import Assessment  
 from app.models.recommendation import Recommendation
 from app.models.chat import ChatMessage
 from app.models.mood import MoodRecord
 
-# ---- Optional: 外部推薦引擎，失敗時走 fallback ----
-try:
-    from app.services.recommendation_engine import recommend_endpoint_payload as _build_reco  # type: ignore
-except Exception:
-    _build_reco = None  # type: ignore
+# Chat router
+from app.chat import router as chat_router
 
+# ============================================================================
+# FastAPI App
+# ============================================================================
+
+app = FastAPI(title="Emobot Backend", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://emobot-plus.vercel.app",
+        "http://localhost:5173", 
+        "http://localhost:3000"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.on_event("startup")
+async def startup():
+    try:
+        Base.metadata.create_all(bind=engine)
+        print("✅ Database tables created")
+    except Exception as e:
+        print(f"❌ Startup error: {e}")
+
+app.include_router(chat_router)
+
+# ============================================================================
+# Schemas with Enhanced Validation
+# ============================================================================
+
+class JoinRequest(BaseModel):
+    pid: str = Field(..., min_length=4, max_length=4)
+    nickname: str = Field(..., min_length=2, max_length=20)
+    
+    @validator('pid')
+    def validate_pid_format(cls, v):
+        v = v.strip().upper()
+        if not re.match(r'^\d{3}[A-Z]{1}$', v):
+            raise ValueError('PID 格式必須為三位數字＋一位英文大寫字母（例：123A）')
+        return v
+    
+    @validator('nickname')
+    def validate_nickname(cls, v):
+        v = v.strip()
+        if len(v) < 2:
+            raise ValueError('暱稱至少需要2個字元')
+        if len(v) > 20:
+            raise ValueError('暱稱不能超過20個字元')
+        return v
+
+class UserStatusResponse(BaseModel):
+    user: Dict[str, Any]
+    has_assessment: bool
+    has_recommendation: bool
+    user_flow_stage: str  # "new", "assessed", "recommended", "active"
+    next_route: str
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+def determine_user_flow_stage(user: User, db: Session) -> Dict[str, Any]:
+    """
+    判斷用戶所處的流程階段
+    """
+    # 檢查是否有測驗記錄
+    assessment = db.query(Assessment).filter(Assessment.user_id == user.id).first()
+    
+    # 檢查是否有推薦記錄
+    recommendation = db.query(Recommendation).filter(Recommendation.user_id == user.id).first()
+    
+    # 判斷流程階段和下一步路由
+    if user.selected_bot:
+        # 已選擇機器人 → 進入會員專區
+        stage = "active"
+        next_route = "/dashboard"
+    elif recommendation:
+        # 有推薦但未選擇 → 進入選擇頁面
+        stage = "recommended" 
+        next_route = "/choose-bot"
+    elif assessment:
+        # 有測驗但無推薦 → 需要生成推薦
+        stage = "assessed"
+        next_route = "/matching"
+    else:
+        # 新用戶 → 進入測驗
+        stage = "new"
+        next_route = "/test"
+    
+    return {
+        "user_flow_stage": stage,
+        "next_route": next_route,
+        "has_assessment": bool(assessment),
+        "has_recommendation": bool(recommendation)
+    }
 
 def _fallback_build_reco(user: Dict[str, Any] | None, assessment: Dict[str, Any] | None) -> Dict[str, Any]:
-    """
-    簡單、可重現的回退推薦：由 mbti_encoded[4] 推出四型分數（0~1），回傳 0~100 的排序結果。
-    """
+    """簡化的推薦算法"""
     empathy = insight = solution = cognitive = 0.25
-    if assessment:
-        enc = assessment.get("mbti_encoded")
+    if assessment and assessment.get("mbti_encoded"):
+        enc = assessment["mbti_encoded"]
         if isinstance(enc, (list, tuple)) and len(enc) >= 4:
             def norm(v):
                 try:
                     v = float(v)
-                    if v > 1:  # 可能是 0~100
-                        v = v / 100.0
-                    return min(max(v, 0.0), 1.0)
-                except Exception:
+                    return min(max(v / 100.0 if v > 1 else v, 0.0), 1.0)
+                except:
                     return 0.5
             E, N, T, J = [norm(v) for v in enc[:4]]
             empathy = 0.55 * (1 - T) + 0.25 * (1 - J) + 0.20 * E
-            insight = 0.50 * N + 0.30 * (1 - T) + 0.20 * J
+            insight = 0.50 * N + 0.30 * (1 - T) + 0.20 * J  
             solution = 0.45 * J + 0.30 * T + 0.25 * (1 - E)
             cognitive = 0.40 * T + 0.30 * (1 - N) + 0.30 * J
 
-    raw = {
-        "empathy": float(min(max(empathy, 0.0), 1.0)),
-        "insight": float(min(max(insight, 0.0), 1.0)),
-        "solution": float(min(max(solution, 0.0), 1.0)),
-        "cognitive": float(min(max(cognitive, 0.0), 1.0)),
-    }
+    raw = {"empathy": empathy, "insight": insight, "solution": solution, "cognitive": cognitive}
     ranked = [{"type": k, "score": round(v * 100, 2)} for k, v in sorted(raw.items(), key=lambda kv: kv[1], reverse=True)]
-    top = {"type": ranked[0]["type"], "score": ranked[0]["score"]}
-    return {
-        "ok": True,
-        "user": {"pid": (user or {}).get("pid")} if user else None,
-        "scores": raw,
-        "ranked": ranked,
-        "top": top,
-        "algorithm_version": "fallback_v1",
-        "params": {},
-    }
+    return {"ok": True, "scores": raw, "ranked": ranked, "top": {"type": ranked[0]["type"], "score": ranked[0]["score"]}}
 
+# ============================================================================
+# Routes
+# ============================================================================
 
-def build_recommendation_payload(user: Dict[str, Any] | None, assessment: Dict[str, Any] | None) -> Dict[str, Any]:
-    if callable(_build_reco):
-        try:
-            return _build_reco(user=user, assessment=assessment)  # type: ignore
-        except Exception:
-            return _fallback_build_reco(user, assessment)
-    return _fallback_build_reco(user, assessment)
+@app.get("/")
+async def root():
+    return {"message": "Emobot Backend", "version": "1.0.0", "status": "enhanced"}
 
+@app.get("/api/health") 
+async def health():
+    return {"ok": True, "version": "1.0.0", "time": datetime.utcnow().isoformat() + "Z"}
 
-# -----------------------------------------------------------------------------
-# FastAPI App
-# -----------------------------------------------------------------------------
+@app.get("/api/debug/simple-test")
+async def simple_test():
+    return {"ok": True, "message": "Enhanced version running"}
 
-app = FastAPI(title="Emobot Backend", version="0.5.0")
+# ============================================================================
+# Enhanced Authentication
+# ============================================================================
 
-# ---- CORS（官方 + 強化補丁）----
-ALLOWED = getattr(settings, "ALLOWED_ORIGINS", os.getenv(
-    "ALLOWED_ORIGINS",
-    "https://emobot-plus.vercel.app,http://localhost:5173,http://localhost:3000"
-))
-
-
-def _parse_allowed(origins_str: str) -> List[str]:
-    out: List[str] = []
-    for s in (origins_str or "").split(","):
-        s = s.strip()
-        if not s or s in ("*", "null"):
-            continue
-        out.append(s)
-    return out
-
-
-_ALLOWED_ORIGINS = _parse_allowed(ALLOWED)
-_VERCEL_REGEX_STR = r"^https://.*\.vercel\.app$"
-_VERCEL_REGEX = re.compile(_VERCEL_REGEX_STR, re.IGNORECASE)
-
-# 1) 官方 middleware（處理多數情形）
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_ALLOWED_ORIGINS,
-    allow_origin_regex=_VERCEL_REGEX_STR,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-)
-
-
-# 2) 自訂補丁：確保錯誤時也帶 CORS，並正確處理預檢 OPTIONS
-@app.middleware("http")
-async def _force_cors_headers(request: Request, call_next):
-    origin = request.headers.get("origin")
-    is_allowed = bool(origin and (origin in _ALLOWED_ORIGINS or _VERCEL_REGEX.match(origin or "")))
-
-    # 預檢：直接 204
-    if request.method.upper() == "OPTIONS":
-        acrm = request.headers.get("access-control-request-method", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
-        acrh = request.headers.get("access-control-request-headers", "Authorization,Content-Type,X-Requested-With")
-        headers = {
-            "Access-Control-Allow-Origin": origin if is_allowed else "",
-            "Access-Control-Allow-Credentials": "true" if is_allowed else "false",
-            "Access-Control-Allow-Methods": acrm,
-            "Access-Control-Allow-Headers": acrh,
-            "Access-Control-Max-Age": "86400",
-            "Access-Control-Expose-Headers": "*",
-            "Vary": "Origin",
-        }
-        return Response(status_code=204, headers=headers)
-
-    # 一般請求：就算內層丟錯，也改包成 JSONResponse 再補 CORS
+@app.post("/api/auth/join")
+async def join(body: JoinRequest, db: Session = Depends(get_db)):
     try:
-        resp = await call_next(request)
-    except HTTPException as he:
-        resp = JSONResponse({"detail": he.detail}, status_code=he.status_code)
-    except Exception:
-        resp = JSONResponse({"detail": "Internal Server Error"}, status_code=500)
-
-    if is_allowed:
-        resp.headers.setdefault("Access-Control-Allow-Origin", origin)
-        resp.headers.setdefault("Access-Control-Allow-Credentials", "true")
-        resp.headers.setdefault("Access-Control-Expose-Headers", "*")
-        vary = resp.headers.get("Vary")
-        resp.headers["Vary"] = "Origin" if not vary else (vary if "Origin" in vary else f"{vary}, Origin")
-    return resp
-
-
-# ---- 啟動時建表（若你用 Alembic 可拿掉）----
-@app.on_event("startup")
-def on_startup():
-    Base.metadata.create_all(bind=engine)
-
-
-# -----------------------------------------------------------------------------
-# Schemas
-# -----------------------------------------------------------------------------
-
-class JoinRequest(BaseModel):
-    pid: str = Field(..., min_length=1, max_length=50)
-    nickname: Optional[str] = Field(default=None, max_length=100)
-
-
-class AssessmentUpsert(BaseModel):
-    mbti_raw: Optional[str] = None
-    mbti_encoded: Optional[List[float]] = None
-    step2_answers: Optional[List[Any]] = None
-    step3_answers: Optional[List[Any]] = None
-    step4_answers: Optional[List[Any]] = None
-    ai_preference: Optional[Dict[str, Any]] = None
-    submittedAt: Optional[datetime] = None
-
-
-class MatchChoice(BaseModel):
-    bot_type: str = Field(..., description="empathy | insight | solution | cognitive")
-
-
-class ChatSendRequest(BaseModel):
-    message: str
-    bot_type: Optional[str] = None
-    mode: Optional[str] = "text"
-
-
-class ChatMessageCreate(BaseModel):
-    content: str
-    role: str = Field(..., description="user | ai")
-    bot_type: Optional[str] = None
-    mode: Optional[str] = "text"
-    user_mood: Optional[str] = None
-    mood_intensity: Optional[int] = None
-
-
-class MoodRecordCreate(BaseModel):
-    mood: str
-    intensity: Optional[int] = None
-    note: Optional[str] = None
-
-
-# -----------------------------------------------------------------------------
-# Health & Debug
-# -----------------------------------------------------------------------------
-
-@app.get("/api/health")
-def health():
-    return {"ok": True, "time": datetime.utcnow().isoformat() + "Z"}
-
-
-@app.get("/api/debug/db-test")
-def db_test(db: Session = Depends(get_db)):
-    try:
-        db.execute(text("select 1"))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"DB not ready: {e}")
-    return {"ok": True}
-
-
-# -----------------------------------------------------------------------------
-# Auth & Profile
-# -----------------------------------------------------------------------------
-
-def _auth_join(body: JoinRequest, db: Session):
-    pid = (body.pid or "").strip()
-    if not pid:
-        raise HTTPException(status_code=422, detail="pid is required")
-
-    user = db.query(User).filter(User.pid == pid).first()
-    if not user:
-        user = User(pid=pid, nickname=body.nickname or None)
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-    else:
-        if body.nickname and user.nickname != body.nickname:
-            user.nickname = body.nickname
+        # PID 和 nickname 已通過 Pydantic 驗證
+        pid = body.pid
+        nickname = body.nickname
+        
+        # 查找或創建用戶
+        user = db.query(User).filter(User.pid == pid).first()
+        if not user:
+            user = User(pid=pid, nickname=nickname)
             db.add(user)
             db.commit()
             db.refresh(user)
-
-    token = create_access_token(user_id=user.id, pid=user.pid)
-    return {
-        "token": token,
-        "user": {
-            "id": user.id,
-            "pid": user.pid,
-            "nickname": user.nickname,
-            "selected_bot": user.selected_bot
+            print(f"✅ New user created: {pid}")
+        else:
+            # 更新暱稱（允許用戶修改顯示名稱）
+            if user.nickname != nickname:
+                user.nickname = nickname
+                db.add(user)
+                db.commit()
+                db.refresh(user)
+            print(f"✅ Existing user logged in: {pid}")
+        
+        # 判斷用戶流程狀態
+        flow_info = determine_user_flow_stage(user, db)
+        
+        # 生成 JWT token
+        token = create_access_token(user_id=user.id, pid=user.pid)
+        
+        # 返回完整用戶資訊和流程狀態
+        return {
+            "token": token,
+            "user": {
+                "id": user.id,
+                "pid": user.pid,
+                "nickname": user.nickname,
+                "selected_bot": user.selected_bot,
+                "created_at": user.created_at.isoformat() + "Z" if user.created_at else None
+            },
+            **flow_info
         }
-    }
+        
+    except ValueError as ve:
+        # Pydantic 驗證錯誤
+        raise HTTPException(status_code=422, detail=str(ve))
+    except Exception as e:
+        print(f"❌ Join error: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail="登入失敗，請稍後再試")
 
-
-@app.post("/api/auth/join")
-def join(body: JoinRequest, db: Session = Depends(get_db)):
-    return _auth_join(body, db)
-
+@app.get("/api/user/status")
+async def user_status(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """
+    獲取用戶完整狀態，用於前端路由決策
+    """
+    try:
+        flow_info = determine_user_flow_stage(user, db)
+        
+        return UserStatusResponse(
+            user={
+                "id": user.id,
+                "pid": user.pid, 
+                "nickname": user.nickname,
+                "selected_bot": user.selected_bot
+            },
+            **flow_info
+        )
+    except Exception as e:
+        print(f"❌ User status error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/user/profile")
-def profile(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    # 獲取最新的評估和推薦
-    latest_assessment = (
-        db.query(Assessment)
-        .filter(Assessment.user_id == user.id)
-        .order_by(Assessment.id.desc())
-        .first()
-    )
-    
-    latest_recommendation = (
-        db.query(Recommendation)
-        .filter(Recommendation.user_id == user.id)
-        .order_by(Recommendation.id.desc())
-        .first()
-    )
-
-    recommendation_data = None
-    if latest_recommendation and latest_recommendation.scores:
-        # 計算排序分數 (0~100)
-        ranked = sorted(
-            [{"type": k, "score": round(float(v) * 100, 2)} for k, v in latest_recommendation.scores.items()],
-            key=lambda x: x["score"], reverse=True
-        )
-        
-        recommendation_data = {
-            "id": latest_recommendation.id,
-            "scores": latest_recommendation.scores,  # 原始 0~1 分數
-            "ranked": ranked,  # 排序後的 0~100 分數
-            "top": {"type": ranked[0]["type"], "score": ranked[0]["score"]} if ranked else None,
-            "created_at": latest_recommendation.created_at.isoformat() + "Z",
-        }
-
-    assessment_data = None
-    if latest_assessment:
-        assessment_data = {
-            "id": latest_assessment.id,
-            "mbti": {
-                "raw": latest_assessment.mbti_raw,
-                "encoded": latest_assessment.mbti_encoded
+async def profile(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    try:
+        flow_info = determine_user_flow_stage(user, db)
+        return {
+            "user": {
+                "id": user.id,
+                "pid": user.pid,
+                "nickname": user.nickname, 
+                "selected_bot": user.selected_bot
             },
-            "step2_answers": latest_assessment.step2_answers,
-            "step3_answers": latest_assessment.step3_answers,
-            "step4_answers": latest_assessment.step4_answers,
-            "submitted_at": latest_assessment.created_at.isoformat() + "Z"
+            **flow_info
         }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    return {
-        "ok": True,
-        "user": {
-            "id": user.id,
-            "pid": user.pid,
-            "nickname": user.nickname,
-            "selected_bot": user.selected_bot
-        },
-        "latest_assessment": assessment_data,
-        "latest_recommendation": recommendation_data
-    }
-
-
-# -----------------------------------------------------------------------------
-# Assessments
-# -----------------------------------------------------------------------------
+# ============================================================================
+# Assessment Flow
+# ============================================================================
 
 @app.post("/api/assessments/upsert")
-def upsert_assessment(
-    body: AssessmentUpsert,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+async def upsert_assessment(
+    body: dict,
+    user: User = Depends(get_current_user), 
+    db: Session = Depends(get_db)
 ):
-    # ★ 新增評估記錄（不刪除舊的，保留歷史）
-    assessment = Assessment(
-        user_id=user.id,
-        mbti_raw=body.mbti_raw,
-        mbti_encoded=body.mbti_encoded,
-        step2_answers=body.step2_answers,
-        step3_answers=body.step3_answers,
-        step4_answers=body.step4_answers,
-        created_at=body.submittedAt or datetime.utcnow(),
-    )
-    db.add(assessment)
-    db.commit()
-    db.refresh(assessment)
-    
-    return {"ok": True, "assessment_id": assessment.id}
-
+    try:
+        # 檢查是否已有測驗記錄
+        existing = db.query(Assessment).filter(Assessment.user_id == user.id).first()
+        if existing:
+            # 更新現有記錄
+            for key, value in body.items():
+                if hasattr(existing, key):
+                    setattr(existing, key, value)
+            existing.submitted_at = body.get('submittedAt') or datetime.utcnow()
+            db.add(existing)
+            assessment_id = existing.id
+        else:
+            # 創建新記錄
+            a = Assessment(
+                user_id=user.id,
+                mbti_raw=body.get('mbti_raw'),
+                mbti_encoded=body.get('mbti_encoded'),
+                step2_answers=body.get('step2_answers'),
+                step3_answers=body.get('step3_answers'),
+                step4_answers=body.get('step4_answers'),
+                ai_preference=body.get('ai_preference'),
+                submitted_at=body.get('submittedAt') or datetime.utcnow()
+            )
+            db.add(a)
+            db.commit()
+            db.refresh(a)
+            assessment_id = a.id
+            
+        db.commit()
+        print(f"✅ Assessment saved for user {user.pid}")
+        return {"ok": True, "assessment_id": assessment_id}
+        
+    except Exception as e:
+        print(f"❌ Assessment error: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/assessments/me")
-def my_assessment(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    assessment = (
-        db.query(Assessment)
-        .filter(Assessment.user_id == user.id)
-        .order_by(Assessment.id.desc())
-        .first()
-    )
-    if not assessment:
-        return {"assessment": None}
-        
-    return {
-        "assessment": {
-            "id": assessment.id,
-            "mbti_raw": assessment.mbti_raw,
-            "mbti_encoded": assessment.mbti_encoded,
-            "step2_answers": assessment.step2_answers,
-            "step3_answers": assessment.step3_answers,
-            "step4_answers": assessment.step4_answers,
-            "created_at": assessment.created_at.isoformat() + "Z",
+async def my_assessment(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    try:
+        a = db.query(Assessment).filter(Assessment.user_id == user.id).order_by(Assessment.id.desc()).first()
+        if not a:
+            return {"assessment": None}
+        return {
+            "assessment": {
+                "id": a.id,
+                "mbti_raw": a.mbti_raw,
+                "mbti_encoded": a.mbti_encoded,
+                "submitted_at": a.submitted_at.isoformat() + "Z" if a.submitted_at else None
+            }
         }
-    }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-
-# -----------------------------------------------------------------------------
-# Matching
-# -----------------------------------------------------------------------------
+# ============================================================================
+# Matching & Bot Selection
+# ============================================================================
 
 @app.post("/api/match/recommend")
-def recommend(
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    # 獲取最新評估
-    assessment = (
-        db.query(Assessment)
-        .filter(Assessment.user_id == user.id)
-        .order_by(Assessment.id.desc())
-        .first()
-    )
-    if not assessment:
-        raise HTTPException(status_code=400, detail="No assessment found")
+async def recommend(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    try:
+        # 獲取最新測驗結果
+        a = db.query(Assessment).filter(Assessment.user_id == user.id).order_by(Assessment.id.desc()).first()
+        if not a:
+            raise HTTPException(status_code=400, detail="請先完成心理測驗")
 
-    # 準備數據給推薦引擎
-    user_payload = {"id": user.id, "pid": user.pid, "nickname": user.nickname}
-    assessment_payload = {
-        "id": assessment.id,
-        "mbti_raw": assessment.mbti_raw,
-        "mbti_encoded": assessment.mbti_encoded,
-        "step2Answers": assessment.step2_answers,  # 注意：引擎期望的是駝峰命名
-        "step3Answers": assessment.step3_answers,
-        "step4Answers": assessment.step4_answers,
-    }
-    
-    # 呼叫推薦引擎
-    result = build_recommendation_payload(user_payload, assessment_payload)
-    if not result or not result.get("scores"):
-        raise HTTPException(status_code=500, detail="Recommendation engine failed")
-
-    scores = result["scores"]  # 0~1 分數
-    ranked = sorted(
-        [{"type": k, "score": round(float(v) * 100, 2)} for k, v in scores.items()],
-        key=lambda x: x["score"], reverse=True
-    )
-    top_type = ranked[0]["type"] if ranked else None
-
-    # ★ 新增推薦記錄（不刪除舊的，但會成為最新的）
-    recommendation = Recommendation(
-        user_id=user.id,
-        scores=scores,
-        ranked=ranked,  # 儲存排序結果
-        selected_bot=None,  # 尚未選擇
-        created_at=datetime.utcnow(),
-    )
-    db.add(recommendation)
-    db.commit()
-    db.refresh(recommendation)
-
-    return {
-        "ok": True,
-        "scores": scores,
-        "ranked": ranked,
-        "top": {"type": top_type, "score": ranked[0]["score"] if ranked else 0},
-        "recommendation_id": recommendation.id,
-        "algorithm_version": result.get("algorithm_version"),
-    }
-
+        # 生成推薦
+        result = _fallback_build_reco(
+            {"id": user.id, "pid": user.pid},
+            {
+                "mbti_encoded": a.mbti_encoded,
+                "step2_answers": a.step2_answers,
+                "step3_answers": a.step3_answers,
+                "step4_answers": a.step4_answers
+            }
+        )
+        
+        # 儲存推薦結果
+        existing_rec = db.query(Recommendation).filter(Recommendation.user_id == user.id).first()
+        if existing_rec:
+            existing_rec.scores = result["scores"]
+            existing_rec.ranked = result["ranked"] 
+            existing_rec.selected_bot = result["top"]["type"]
+            db.add(existing_rec)
+        else:
+            rec = Recommendation(
+                user_id=user.id,
+                assessment_id=a.id,
+                selected_bot=result["top"]["type"],
+                scores=result["scores"],
+                ranked=result["ranked"]
+            )
+            db.add(rec)
+            
+        db.commit()
+        print(f"✅ Recommendation generated for user {user.pid}: {result['top']['type']}")
+        
+        return {
+            "ok": True,
+            "scores": result["scores"],
+            "ranked": result["ranked"], 
+            "top": result["top"],
+            "next_step": "choose_bot"
+        }
+        
+    except Exception as e:
+        print(f"❌ Recommendation error: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/match/choose")
-def choose_bot(
-    body: MatchChoice,
+async def choose_bot(
+    body: dict,
     user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db)
 ):
-    valid = {"empathy", "insight", "solution", "cognitive"}
-    if body.bot_type not in valid:
-        raise HTTPException(status_code=422, detail=f"Invalid bot_type, must be one of {sorted(valid)}")
+    try:
+        bot_type = body.get("bot_type")
+        valid_bots = {"empathy", "insight", "solution", "cognitive"}
+        
+        if bot_type not in valid_bots:
+            raise HTTPException(status_code=422, detail=f"無效的機器人類型，必須是 {valid_bots} 之一")
 
-    # ★ 更新用戶選擇的機器人（這會覆蓋之前的選擇）
-    user.selected_bot = body.bot_type
-    db.add(user)
-    
-    # ★ 更新最新推薦記錄的選擇
-    latest_recommendation = (
-        db.query(Recommendation)
-        .filter(Recommendation.user_id == user.id)
-        .order_by(Recommendation.id.desc())
-        .first()
-    )
-    if latest_recommendation:
-        latest_recommendation.selected_bot = body.bot_type
-        db.add(latest_recommendation)
-    
-    db.commit()
-    
-    return {"ok": True, "selected_bot": user.selected_bot}
-
+        # 更新用戶選擇
+        user.selected_bot = bot_type
+        db.add(user)
+        db.commit()
+        
+        print(f"✅ User {user.pid} selected bot: {bot_type}")
+        
+        return {
+            "ok": True,
+            "selected_bot": user.selected_bot,
+            "message": f"已選擇 {bot_type} 機器人",
+            "next_route": "/dashboard"
+        }
+        
+    except Exception as e:
+        print(f"❌ Bot selection error: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/match/me")
-def my_match(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    latest_recommendation = (
-        db.query(Recommendation)
-        .filter(Recommendation.user_id == user.id)
-        .order_by(Recommendation.id.desc())
-        .first()
-    )
-    
-    if not latest_recommendation:
-        return {"selected_bot": user.selected_bot, "latest_recommendation": None}
-
-    ranked = latest_recommendation.ranked or []
-    if not ranked and latest_recommendation.scores:
-        # 如果沒有預存排序，重新計算
-        ranked = sorted(
-            [{"type": k, "score": round(float(v) * 100, 2)} for k, v in latest_recommendation.scores.items()],
-            key=lambda x: x["score"], reverse=True
-        )
-
-    return {
-        "selected_bot": user.selected_bot,
-        "latest_recommendation": {
-            "id": latest_recommendation.id,
-            "scores": latest_recommendation.scores,
-            "ranked": ranked,
-            "top": {"type": ranked[0]["type"], "score": ranked[0]["score"]} if ranked else None,
-            "created_at": latest_recommendation.created_at.isoformat() + "Z",
+async def my_match(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    try:
+        rec = db.query(Recommendation).filter(Recommendation.user_id == user.id).order_by(Recommendation.id.desc()).first()
+        
+        return {
+            "selected_bot": user.selected_bot,
+            "latest_recommendation": {
+                "scores": rec.scores if rec else None,
+                "ranked": rec.ranked if rec else None,
+                "created_at": rec.created_at.isoformat() + "Z" if rec else None
+            } if rec else None
         }
-    }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-
-# -----------------------------------------------------------------------------
-# Chat
-# -----------------------------------------------------------------------------
+# ============================================================================
+# Chat & Mood (Simplified Legacy Support)
+# ============================================================================
 
 @app.post("/api/chat/messages")
-def save_chat_message(
-    body: ChatMessageCreate,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    if body.role not in ("user", "ai"):
-        raise HTTPException(status_code=422, detail="role must be 'user' or 'ai'")
-
-    msg = ChatMessage(
-        user_id=user.id,
-        bot_type=body.bot_type or (user.selected_bot or "empathy"),
-        mode=body.mode or "text",
-        role=body.role,
-        content=body.content,
-        created_at=datetime.utcnow(),
-        meta={"user_mood": body.user_mood, "mood_intensity": body.mood_intensity},
-    )
-    db.add(msg)
-    db.commit()
-    db.refresh(msg)
-    return {"ok": True, "id": msg.id, "created_at": msg.created_at.isoformat() + "Z"}
-
-
-@app.get("/api/chat/messages")
-def get_chat_messages(
-    limit: int = Query(50, ge=1, le=200),
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    rows = (
-        db.query(ChatMessage)
-        .filter(ChatMessage.user_id == user.id)
-        .order_by(ChatMessage.id.desc())
-        .limit(limit)
-        .all()
-    )
-    out = [
-        {
-            "id": r.id,
-            "bot_type": r.bot_type,
-            "mode": r.mode,
-            "role": r.role,
-            "content": r.content,
-            "created_at": r.created_at.isoformat() + "Z",
-            "meta": r.meta,
-        }
-        for r in rows[::-1]
-    ]
-    return {"messages": out}
-
-
-@app.post("/api/chat/send")
-def chat_send(
-    body: ChatSendRequest,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    user_text = (body.message or "").strip()
-    if not user_text:
-        raise HTTPException(status_code=422, detail="message is required")
-
-    # 1) 儲存使用者訊息
-    umsg = ChatMessage(
-        user_id=user.id,
-        bot_type=body.bot_type or (user.selected_bot or "empathy"),
-        mode=body.mode or "text",
-        role="user",
-        content=user_text,
-        created_at=datetime.utcnow(),
-    )
-    db.add(umsg)
-    db.commit()
-    db.refresh(umsg)
-
-    # 2) 呼叫 OpenAI（失敗時會回傳 debug 文本）
-    reply_text = None
+async def save_chat_message(body: dict, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     try:
-        from openai import OpenAI  # openai>=1.0
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        system_prompt = "You are Emobot, a supportive counseling assistant. Keep responses concise and empathetic."
-        completion = client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_text},
-            ],
-            temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.7")),
-            max_tokens=int(os.getenv("OPENAI_MAX_TOKENS", "512")),
+        # 確保用戶已選擇機器人
+        if not user.selected_bot:
+            raise HTTPException(status_code=400, detail="請先選擇機器人")
+            
+        msg = ChatMessage(
+            user_id=user.id,
+            role=body.get("role", "user"),
+            content=body.get("content", ""),
+            bot_type=body.get("bot_type") or user.selected_bot,
+            mode=body.get("mode", "text")
         )
-        reply_text = completion.choices[0].message.content if completion and completion.choices else None
+        db.add(msg)
+        db.commit()
+        return {"ok": True, "id": msg.id}
     except Exception as e:
-        reply_text = f"(debug) OpenAI unavailable: {e}. Echo: {user_text[:200]}"
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
 
-    # 3) 儲存 AI 回覆
-    atext = reply_text or "..."
-    amsg = ChatMessage(
-        user_id=user.id,
-        bot_type=body.bot_type or (user.selected_bot or "empathy"),
-        mode=body.mode or "text",
-        role="ai",
-        content=atext,
-        created_at=datetime.utcnow(),
-    )
-    db.add(amsg)
-    db.commit()
-    db.refresh(amsg)
+@app.get("/api/chat/messages") 
+async def get_chat_messages(limit: int = Query(50), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    try:
+        rows = db.query(ChatMessage).filter(ChatMessage.user_id == user.id).order_by(ChatMessage.id.desc()).limit(limit).all()
+        return {"messages": [{"id": r.id, "role": r.role, "content": r.content, "bot_type": r.bot_type} for r in rows]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    return {"reply": atext, "message_id": amsg.id}
-
-
-# -----------------------------------------------------------------------------
-# Mood
-# -----------------------------------------------------------------------------
+# ============================================================================
+# Mood Records
+# ============================================================================
 
 @app.post("/api/mood/records")
-def create_mood(
-    body: MoodRecordCreate,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    rec = MoodRecord(
-        user_id=user.id,
-        mood=body.mood,
-        intensity=body.intensity,
-        note=body.note,
-        created_at=datetime.utcnow(),
-    )
-    db.add(rec)
-    db.commit()
-    db.refresh(rec)
-    return {"ok": True, "id": rec.id, "created_at": rec.created_at.isoformat() + "Z"}
+async def create_mood(body: dict, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    try:
+        rec = MoodRecord(
+            user_id=user.id,
+            mood=body.get("mood"),
+            intensity=body.get("intensity"), 
+            note=body.get("note")
+        )
+        db.add(rec)
+        db.commit()
+        return {"ok": True, "id": rec.id}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
 
-
-@app.get("/api/mood/records")
-def list_mood(
-    days: int = Query(30, ge=1, le=365),
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    since = datetime.utcnow() - timedelta(days=days)
-    rows = (
-        db.query(MoodRecord)
-        .filter(and_(MoodRecord.user_id == user.id, MoodRecord.created_at >= since))
-        .order_by(MoodRecord.id.desc())
-        .all()
-    )
-    return {
-        "records": [
-            {
-                "id": r.id,
-                "mood": r.mood,
-                "intensity": r.intensity,
-                "note": r.note,
-                "created_at": r.created_at.isoformat() + "Z",
-            }
-            for r in rows[::-1]
-        ]
-    }
-
-
-# ★ 新增：重新測驗清除端點（可選）
-@app.post("/api/user/reset-bot-choice")
-def reset_bot_choice(
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """
-    重設使用者的機器人選擇，但保留聊天記錄和評估歷史
-    主要用於重新測驗流程
-    """
-    # 只重設 selected_bot，不刪除任何歷史數據
-    user.selected_bot = None
-    db.add(user)
-    db.commit()
-    
-    return {
-        "ok": True,
-        "message": "Bot choice reset successfully. Historical data preserved."
-    }
-
-
-# -----------------------------------------------------------------------------
-# 引入聊天路由
-# -----------------------------------------------------------------------------
-try:
-    from app.chat import router as chat_router
-    app.include_router(chat_router)
-except ImportError:
-    print("[WARN] app.chat module not found, chat routes not included")
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
