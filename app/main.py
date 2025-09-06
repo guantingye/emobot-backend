@@ -561,13 +561,13 @@ def chat_send(
         client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         system_prompt = "You are Emobot, a supportive counseling assistant. Keep responses concise and empathetic."
         completion = client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            model=os.getenv("OPENAI_MODEL", "gpt-4o"),
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_text},
             ],
             temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.7")),
-            max_tokens=int(os.getenv("OPENAI_MAX_TOKENS", "512")),
+            max_tokens=int(os.getenv("OPENAI_MAX_TOKENS", "600")),
         )
         reply_text = completion.choices[0].message.content if completion and completion.choices else None
     except Exception as e:
