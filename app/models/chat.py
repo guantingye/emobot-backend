@@ -26,6 +26,6 @@ class ChatMessage(Base):
     mode = Column(String, default="text")  
     meta = Column(JSON, nullable=True)
     
-    created_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)  # ★ 修正：使用 default 而非 server_default
+    created_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)  
 
     user = relationship("User", back_populates="chat_messages", lazy="select")
