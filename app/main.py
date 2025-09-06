@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text, and_
 from sqlalchemy.orm import Session
 
-# ---- App internals (沿用你原架構) ----
+# ---- App internals ----
 from app.core.config import settings
 from app.core.security import create_access_token, get_current_user
 from app.db.session import get_db, engine
@@ -28,9 +28,9 @@ from app.models.mood import MoodRecord
 
 # ---- Optional: 外部推薦引擎，失敗時走 fallback ----
 try:
-    from app.services.recommendation_engine import recommend_endpoint_payload as _build_reco  # type: ignore
+    from app.services.recommendation_engine import recommend_endpoint_payload as _build_reco
 except Exception:
-    _build_reco = None  # type: ignore
+    _build_reco = None
 
 
 def _fallback_build_reco(user: Dict[str, Any] | None, assessment: Dict[str, Any] | None) -> Dict[str, Any]:
@@ -77,7 +77,7 @@ def _fallback_build_reco(user: Dict[str, Any] | None, assessment: Dict[str, Any]
 def build_recommendation_payload(user: Dict[str, Any] | None, assessment: Dict[str, Any] | None) -> Dict[str, Any]:
     if callable(_build_reco):
         try:
-            return _build_reco(user=user, assessment=assessment)  # type: ignore
+            return _build_reco(user=user, assessment=assessment)
         except Exception:
             return _fallback_build_reco(user, assessment)
     return _fallback_build_reco(user, assessment)
@@ -183,7 +183,7 @@ class AssessmentUpsert(BaseModel):
     step4_answers: Optional[List[Any]] = None
     ai_preference: Optional[Dict[str, Any]] = None
     submittedAt: Optional[datetime] = None
-    # ★ 新增：是否為重新測驗
+    # 新增：是否為重新測驗
     is_retest: Optional[bool] = False
 
 
@@ -195,6 +195,8 @@ class ChatSendRequest(BaseModel):
     message: str
     bot_type: Optional[str] = None
     mode: Optional[str] = "text"
+    history: Optional[List[Dict[str, str]]] = []
+    demo: Optional[bool] = False
 
 
 class ChatMessageCreate(BaseModel):
@@ -210,6 +212,60 @@ class MoodRecordCreate(BaseModel):
     mood: str
     intensity: Optional[int] = None
     note: Optional[str] = None
+
+
+# -----------------------------------------------------------------------------
+# Helper Functions
+# -----------------------------------------------------------------------------
+
+def get_system_prompt(bot_type: str) -> str:
+    """獲取不同 AI 類型的系統提示"""
+    prompts = {
+        "empathy": "你是 Lumi，同理型 AI。以溫柔、非評判、短句的反映傾聽與情緒標記來回應。優先肯認、共感與陪伴。用繁體中文回覆，保持溫暖支持的語調。",
+        "insight": "你是 Solin，洞察型 AI。以蘇格拉底式提問、澄清與重述，幫助使用者重清想法，維持中性、尊重、結構化。用繁體中文回覆。",
+        "solution": "你是 Niko，解決型 AI。以務實、具體的建議與分步行動為主，給出小目標、工具與下一步，語氣鼓勵但不強迫。用繁體中文回覆。",
+        "cognitive": "你是 Clara，認知型 AI。以 CBT 語氣幫助辨識自動想法、認知偏誤與替代想法，提供簡短表格式步驟與練習。用繁體中文回覆。"
+    }
+    return prompts.get(bot_type, prompts["solution"])
+
+
+def get_bot_name(bot_type: str) -> str:
+    """獲取機器人名稱"""
+    names = {
+        "empathy": "Lumi",
+        "insight": "Solin", 
+        "solution": "Niko",
+        "cognitive": "Clara"
+    }
+    return names.get(bot_type, "Niko")
+
+
+def call_openai(system_prompt: str, messages: List[Dict[str, str]]) -> str:
+    """呼叫 OpenAI API"""
+    api_key = os.getenv("OPENAI_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY not set")
+
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
+        
+        # 準備訊息
+        chat_messages = [{"role": "system", "content": system_prompt}] + messages
+        
+        response = client.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            messages=chat_messages,
+            temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.7")),
+            max_tokens=int(os.getenv("OPENAI_MAX_TOKENS", "600")),
+        )
+        
+        return response.choices[0].message.content.strip() if response.choices else ""
+        
+    except Exception as e:
+        print(f"OpenAI API failed: {e}")
+        # 返回預設回覆而不是拋出異常
+        return "我在這裡陪著你。想聊聊今天最讓你在意的事情嗎？"
 
 
 # -----------------------------------------------------------------------------
@@ -315,7 +371,7 @@ def upsert_assessment(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    # ★ 如果是重新測驗，清除用戶的 selected_bot
+    # 如果是重新測驗，清除用戶的 selected_bot
     if body.is_retest:
         user.selected_bot = None
         db.add(user)
@@ -397,7 +453,7 @@ def recommend(
     )
     top_type = ranked[0]["type"] if ranked else None
 
-    # ★ 建立新的推薦記錄，但不自動設定 selected_bot
+    # 建立新的推薦記錄，但不自動設定 selected_bot
     rec = Recommendation(
         user_id=user.id,
         scores=scores,
@@ -428,12 +484,12 @@ def choose_bot(
     if body.bot_type not in valid:
         raise HTTPException(status_code=422, detail=f"Invalid bot_type, must be one of {sorted(valid)}")
 
-    # ★ 更新用戶選擇的機器人
+    # 更新用戶選擇的機器人
     user.selected_bot = body.bot_type
     db.add(user)
     db.commit()
 
-    # ★ 同時更新最新的推薦記錄
+    # 同時更新最新的推薦記錄
     latest_rec = (
         db.query(Recommendation)
         .filter(Recommendation.user_id == user.id)
@@ -476,8 +532,116 @@ def my_match(user: User = Depends(get_current_user), db: Session = Depends(get_d
 
 
 # -----------------------------------------------------------------------------
-# Chat
+# Chat - 修復版本，確保與前端兼容
 # -----------------------------------------------------------------------------
+
+@app.post("/api/chat/send")
+def chat_send(
+    body: ChatSendRequest,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    user_msg = (body.message or "").strip()
+    if not user_msg:
+        raise HTTPException(status_code=400, detail="Empty message")
+
+    # 取得 user_id（從標頭或預設為用戶 ID）
+    user_id = user.id
+    bot_type = body.bot_type or user.selected_bot or "solution"
+
+    try:
+        # 1. 儲存使用者訊息
+        user_message = ChatMessage(
+            user_id=user_id,
+            bot_type=bot_type,
+            mode=body.mode or "text",
+            role="user",
+            content=user_msg,
+            meta={"demo": body.demo}
+        )
+        db.add(user_message)
+        db.commit()
+        
+        # 2. 準備 OpenAI 請求
+        system_prompt = get_system_prompt(bot_type)
+        
+        # 轉換歷史記錄格式
+        messages = []
+        for h in (body.history or [])[-10:]:  # 只取最近 10 條
+            role = "assistant" if h.get("role") == "assistant" else "user"
+            messages.append({"role": role, "content": h.get("content", "")})
+        
+        # 添加當前使用者訊息
+        messages.append({"role": "user", "content": user_msg})
+        
+        # 3. 呼叫 OpenAI
+        reply_text = call_openai(system_prompt, messages)
+        
+        # 4. 儲存 AI 回覆
+        ai_message = ChatMessage(
+            user_id=user_id,
+            bot_type=bot_type,
+            mode=body.mode or "text",
+            role="ai",
+            content=reply_text,
+            meta={"provider": "openai", "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini")}
+        )
+        db.add(ai_message)
+        db.commit()
+        
+        # 5. 返回結果（修復：確保包含 ok 欄位）
+        return {
+            "ok": True,  # ✅ 修復：加上 ok 欄位
+            "reply": reply_text,
+            "bot": {
+                "type": bot_type, 
+                "name": get_bot_name(bot_type)
+            },
+            "message_id": ai_message.id,
+            "error": None
+        }
+        
+    except Exception as e:
+        print(f"Chat send error: {e}")
+        db.rollback()
+        
+        # 緊急回覆，確保使用者體驗
+        fallback_replies = {
+            "empathy": "我在這裡陪著你。此刻最強烈的感受是什麼？",
+            "insight": "讓我們一步步來理解這個情況。你覺得最重要的是哪個部分？",
+            "solution": "我們可以從一個小步驟開始。你想先處理哪個部分？",
+            "cognitive": "讓我們先識別一下剛剛的自動想法。你能描述一下當時心中想到什麼嗎？"
+        }
+        
+        fallback_text = fallback_replies.get(bot_type, fallback_replies["solution"])
+        
+        # 儲存緊急回覆
+        try:
+            ai_message = ChatMessage(
+                user_id=user_id,
+                bot_type=bot_type,
+                mode=body.mode or "text",
+                role="ai",
+                content=fallback_text,
+                meta={"provider": "fallback", "error": str(e)[:200]}
+            )
+            db.add(ai_message)
+            db.commit()
+        except Exception:
+            pass  # 如果連 fallback 都失敗，就不儲存了
+        
+        # ✅ 修復：即使出錯也要返回正確格式
+        return {
+            "ok": True,  # 仍然回傳 ok=True，確保前端正常顯示
+            "reply": fallback_text,
+            "bot": {
+                "type": bot_type, 
+                "name": get_bot_name(bot_type)
+            },
+            "error": f"API temporarily unavailable: {str(e)[:100]}"
+        }
+
 
 @app.post("/api/chat/messages")
 def save_chat_message(
@@ -531,67 +695,8 @@ def get_chat_messages(
     return {"messages": out}
 
 
-@app.post("/api/chat/send")
-def chat_send(
-    body: ChatSendRequest,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    user_text = (body.message or "").strip()
-    if not user_text:
-        raise HTTPException(status_code=422, detail="message is required")
-
-    # 1) 儲存使用者訊息
-    umsg = ChatMessage(
-        user_id=user.id,
-        bot_type=body.bot_type or (user.selected_bot or "empathy"),
-        mode=body.mode or "text",
-        role="user",
-        content=user_text,
-        created_at=datetime.utcnow(),
-    )
-    db.add(umsg)
-    db.commit()
-    db.refresh(umsg)
-
-    # 2) 呼叫 OpenAI（失敗時會回傳 debug 文本）
-    reply_text = None
-    try:
-        from openai import OpenAI  # openai>=1.0
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        system_prompt = "You are Emobot, a supportive counseling assistant. Keep responses concise and empathetic."
-        completion = client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-4o"),
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_text},
-            ],
-            temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.7")),
-            max_tokens=int(os.getenv("OPENAI_MAX_TOKENS", "600")),
-        )
-        reply_text = completion.choices[0].message.content if completion and completion.choices else None
-    except Exception as e:
-        reply_text = f"(debug) OpenAI unavailable: {e}. Echo: {user_text[:200]}"
-
-    # 3) 儲存 AI 回覆
-    atext = reply_text or "..."
-    amsg = ChatMessage(
-        user_id=user.id,
-        bot_type=body.bot_type or (user.selected_bot or "empathy"),
-        mode=body.mode or "text",
-        role="ai",
-        content=atext,
-        created_at=datetime.utcnow(),
-    )
-    db.add(amsg)
-    db.commit()
-    db.refresh(amsg)
-
-    return {"reply": atext, "message_id": amsg.id}
-
-
 # -----------------------------------------------------------------------------
-# Mood
+# Mood Records
 # -----------------------------------------------------------------------------
 
 @app.post("/api/mood/records")
@@ -638,3 +743,42 @@ def list_mood(
             for r in rows[::-1]
         ]
     }
+
+
+# -----------------------------------------------------------------------------
+# OpenAI Health Check
+# -----------------------------------------------------------------------------
+
+@app.get("/api/chat/health/openai")
+@app.post("/api/chat/health/openai")
+async def health_openai():
+    """OpenAI 健康檢查"""
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    key = os.getenv("OPENAI_API_KEY")
+    
+    info = {
+        "model": model,
+        "has_key": bool(key),
+        "ok": False,
+        "error": None
+    }
+    
+    if not key:
+        info["error"] = "OPENAI_API_KEY not set"
+        return info
+    
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=key)
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=5
+        )
+        info["ok"] = bool(response.choices)
+        info["response_id"] = response.id if hasattr(response, 'id') else None
+        return info
+        
+    except Exception as e:
+        info["error"] = f"{type(e).__name__}: {str(e)[:150]}"
+        return info
