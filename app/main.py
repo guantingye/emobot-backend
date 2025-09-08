@@ -25,6 +25,9 @@ from app.models.assessment import Assessment
 from app.models.recommendation import Recommendation
 from app.models.chat import ChatMessage
 from app.models.mood import MoodRecord
+# ★ 新增 import
+from app.models.allowed_pid import AllowedPid
+from app.models.chat_session import ChatSession
 
 # ---- Optional: 外部推薦引擎，失敗時走 fallback ----
 try:
@@ -214,15 +217,34 @@ class MoodRecordCreate(BaseModel):
     note: Optional[str] = None
 
 
+# ★ 新增 Pydantic 模型
+class AllowedPidCreate(BaseModel):
+    pid: str = Field(..., min_length=1, max_length=50)
+    description: Optional[str] = Field(default=None, max_length=200)
+
+
+class AllowedPidUpdate(BaseModel):
+    is_active: Optional[bool] = None
+    description: Optional[str] = Field(default=None, max_length=200)
+
+
+class ChatSessionCreate(BaseModel):
+    bot_type: Optional[str] = Field(default="solution")
+
+
+class ChatSessionEnd(BaseModel):
+    reason: str = Field(..., pattern="^(user_ended|timeout|system)$")
+
+
 # -----------------------------------------------------------------------------
 # Helper Functions
 # -----------------------------------------------------------------------------
 
 def get_system_prompt(bot_type: str) -> str:
-    """獲取不同 AI 類型的系統提示"""
+    """取得不同 AI 類型的系統提示"""
     prompts = {
         "empathy": "你是 Lumi，同理型 AI。以溫柔、非評判、短句的反映傾聽與情緒標記來回應。優先肯認、共感與陪伴。用繁體中文回覆，保持溫暖支持的語調。",
-        "insight": "你是 Solin，洞察型 AI。以蘇格拉底式提問、澄清與重述，幫助使用者重清想法，維持中性、尊重、結構化。用繁體中文回覆。",
+        "insight": "你是 Solin，洞察型 AI。以蘇格拉底式提問、澄清與重述，幫助使用者釐清想法，維持中性、尊重、結構化。用繁體中文回覆。",
         "solution": "你是 Niko，解決型 AI。以務實、具體的建議與分步行動為主，給出小目標、工具與下一步，語氣鼓勵但不強迫。用繁體中文回覆。",
         "cognitive": "你是 Clara，認知型 AI。以 CBT 語氣幫助辨識自動想法、認知偏誤與替代想法，提供簡短表格式步驟與練習。用繁體中文回覆。"
     }
@@ -230,7 +252,7 @@ def get_system_prompt(bot_type: str) -> str:
 
 
 def get_bot_name(bot_type: str) -> str:
-    """獲取機器人名稱"""
+    """取得機器人名稱"""
     names = {
         "empathy": "Lumi",
         "insight": "Solin", 
@@ -268,6 +290,84 @@ def call_openai(system_prompt: str, messages: List[Dict[str, str]]) -> str:
         return "我在這裡陪著你。想聊聊今天最讓你在意的事情嗎？"
 
 
+# ★ 新增輔助函數
+def is_pid_allowed(pid: str, db: Session) -> bool:
+    """檢查 PID 是否在允許清單中且為啟用狀態"""
+    allowed_pid = db.query(AllowedPid).filter(
+        AllowedPid.pid == pid,
+        AllowedPid.is_active == True
+    ).first()
+    return allowed_pid is not None
+
+
+def get_or_create_active_session(user_id: int, bot_type: str, db: Session) -> ChatSession:
+    """取得或建立活躍的聊天會話"""
+    # 檢查是否有活躍的會話
+    active_session = db.query(ChatSession).filter(
+        ChatSession.user_id == user_id,
+        ChatSession.is_active == True
+    ).first()
+    
+    if active_session:
+        # 更新最後活動時間
+        active_session.last_activity = datetime.utcnow()
+        active_session.bot_type = bot_type  # 更新機器人類型（如果有切換）
+        db.add(active_session)
+        db.commit()
+        return active_session
+    
+    # 建立新會話
+    new_session = ChatSession(
+        user_id=user_id,
+        bot_type=bot_type,
+        session_start=datetime.utcnow(),
+        last_activity=datetime.utcnow(),
+        is_active=True
+    )
+    db.add(new_session)
+    db.commit()
+    db.refresh(new_session)
+    return new_session
+
+
+def end_inactive_sessions(db: Session, timeout_minutes: int = 5):
+    """結束非活躍的會話（超過指定分鐘數沒有活動）"""
+    timeout_threshold = datetime.utcnow() - timedelta(minutes=timeout_minutes)
+    
+    inactive_sessions = db.query(ChatSession).filter(
+        ChatSession.is_active == True,
+        ChatSession.last_activity < timeout_threshold
+    ).all()
+    
+    for session in inactive_sessions:
+        session.is_active = False
+        session.session_end = datetime.utcnow()
+        session.end_reason = "timeout"
+        db.add(session)
+    
+    if inactive_sessions:
+        db.commit()
+        print(f"已結束 {len(inactive_sessions)} 個非活躍會話")
+    
+    return len(inactive_sessions)
+
+
+def update_session_activity(user_id: int, db: Session):
+    """更新會話活動時間並增加訊息計數"""
+    active_session = db.query(ChatSession).filter(
+        ChatSession.user_id == user_id,
+        ChatSession.is_active == True
+    ).first()
+    
+    if active_session:
+        active_session.last_activity = datetime.utcnow()
+        active_session.message_count += 1
+        db.add(active_session)
+        db.commit()
+    
+    return active_session
+
+
 # -----------------------------------------------------------------------------
 # Health & Debug
 # -----------------------------------------------------------------------------
@@ -294,6 +394,13 @@ def _auth_join(body: JoinRequest, db: Session):
     pid = (body.pid or "").strip()
     if not pid:
         raise HTTPException(status_code=422, detail="pid is required")
+
+    # ★ 新增：檢查 PID 是否在允許清單中
+    if not is_pid_allowed(pid, db):
+        raise HTTPException(
+            status_code=403, 
+            detail="此 PID 未被授權使用系統，請聯繫管理員"
+        )
 
     user = db.query(User).filter(User.pid == pid).first()
     if not user:
@@ -546,11 +653,17 @@ def chat_send(
     if not user_msg:
         raise HTTPException(status_code=400, detail="Empty message")
 
-    # 取得 user_id（從標頭或預設為用戶 ID）
+    # 取得 user_id（從驗證後的用戶）
     user_id = user.id
     bot_type = body.bot_type or user.selected_bot or "solution"
 
     try:
+        # ★ 新增：先清理非活躍會話
+        end_inactive_sessions(db)
+        
+        # ★ 新增：取得或建立聊天會話
+        chat_session = get_or_create_active_session(user_id, bot_type, db)
+
         # 1. 儲存使用者訊息
         user_message = ChatMessage(
             user_id=user_id,
@@ -558,10 +671,13 @@ def chat_send(
             mode=body.mode or "text",
             role="user",
             content=user_msg,
-            meta={"demo": body.demo}
+            meta={"demo": body.demo, "session_id": chat_session.id}  # ★ 新增會話 ID
         )
         db.add(user_message)
         db.commit()
+        
+        # ★ 新增：更新會話活動
+        update_session_activity(user_id, db)
         
         # 2. 準備 OpenAI 請求
         system_prompt = get_system_prompt(bot_type)
@@ -585,20 +701,28 @@ def chat_send(
             mode=body.mode or "text",
             role="ai",
             content=reply_text,
-            meta={"provider": "openai", "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini")}
+            meta={
+                "provider": "openai", 
+                "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                "session_id": chat_session.id  # ★ 新增會話 ID
+            }
         )
         db.add(ai_message)
         db.commit()
         
+        # ★ 新增：再次更新會話活動（AI 回覆也算活動）
+        update_session_activity(user_id, db)
+        
         # 5. 返回結果（修復：確保包含 ok 欄位）
         return {
-            "ok": True,  # ✅ 修復：加上 ok 欄位
+            "ok": True,  
             "reply": reply_text,
             "bot": {
                 "type": bot_type, 
                 "name": get_bot_name(bot_type)
             },
             "message_id": ai_message.id,
+            "session_id": chat_session.id,  # ★ 新增會話資訊
             "error": None
         }
         
@@ -641,6 +765,36 @@ def chat_send(
             },
             "error": f"API temporarily unavailable: {str(e)[:100]}"
         }
+
+
+# ★ 新增：結束聊天會話端點
+@app.post("/api/chat/session/end")
+def end_chat_session(
+    body: ChatSessionEnd,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """手動結束聊天會話"""
+    active_session = db.query(ChatSession).filter(
+        ChatSession.user_id == user.id,
+        ChatSession.is_active == True
+    ).first()
+    
+    if not active_session:
+        raise HTTPException(status_code=404, detail="沒有找到活躍的聊天會話")
+    
+    active_session.is_active = False
+    active_session.session_end = datetime.utcnow()
+    active_session.end_reason = body.reason
+    db.add(active_session)
+    db.commit()
+    
+    return {
+        "ok": True,
+        "session_id": active_session.id,
+        "duration_minutes": round(active_session.duration_minutes, 2),
+        "message_count": active_session.message_count
+    }
 
 
 @app.post("/api/chat/messages")
@@ -741,6 +895,210 @@ def list_mood(
                 "created_at": r.created_at.isoformat() + "Z",
             }
             for r in rows[::-1]
+        ]
+    }
+
+
+# -----------------------------------------------------------------------------
+# ★ 新增：PID 管理端點
+# -----------------------------------------------------------------------------
+
+@app.post("/api/admin/allowed-pids")
+def create_allowed_pid(
+    body: AllowedPidCreate,
+    db: Session = Depends(get_db),
+):
+    """新增允許的 PID（需要管理員權限）"""
+    # 檢查是否已存在
+    existing = db.query(AllowedPid).filter(AllowedPid.pid == body.pid).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="此 PID 已存在")
+    
+    allowed_pid = AllowedPid(
+        pid=body.pid,
+        description=body.description,
+        is_active=True
+    )
+    db.add(allowed_pid)
+    db.commit()
+    db.refresh(allowed_pid)
+    
+    return {
+        "ok": True,
+        "id": allowed_pid.id,
+        "pid": allowed_pid.pid,
+        "description": allowed_pid.description,
+        "is_active": allowed_pid.is_active,
+        "created_at": allowed_pid.created_at.isoformat() + "Z"
+    }
+
+
+@app.get("/api/admin/allowed-pids")
+def get_allowed_pids(
+    active_only: bool = Query(True, description="只顯示啟用的 PID"),
+    db: Session = Depends(get_db),
+):
+    """取得允許的 PID 清單"""
+    query = db.query(AllowedPid)
+    if active_only:
+        query = query.filter(AllowedPid.is_active == True)
+    
+    pids = query.order_by(AllowedPid.created_at.desc()).all()
+    
+    return {
+        "pids": [
+            {
+                "id": p.id,
+                "pid": p.pid,
+                "description": p.description,
+                "is_active": p.is_active,
+                "created_at": p.created_at.isoformat() + "Z",
+                "updated_at": p.updated_at.isoformat() + "Z"
+            } for p in pids
+        ],
+        "total": len(pids)
+    }
+
+
+@app.put("/api/admin/allowed-pids/{pid_id}")
+def update_allowed_pid(
+    pid_id: int,
+    body: AllowedPidUpdate,
+    db: Session = Depends(get_db),
+):
+    """更新允許的 PID"""
+    allowed_pid = db.query(AllowedPid).filter(AllowedPid.id == pid_id).first()
+    if not allowed_pid:
+        raise HTTPException(status_code=404, detail="PID 不存在")
+    
+    if body.is_active is not None:
+        allowed_pid.is_active = body.is_active
+    if body.description is not None:
+        allowed_pid.description = body.description
+    
+    db.add(allowed_pid)
+    db.commit()
+    
+    return {
+        "ok": True,
+        "id": allowed_pid.id,
+        "pid": allowed_pid.pid,
+        "description": allowed_pid.description,
+        "is_active": allowed_pid.is_active
+    }
+
+
+@app.delete("/api/admin/allowed-pids/{pid_id}")
+def delete_allowed_pid(
+    pid_id: int,
+    db: Session = Depends(get_db),
+):
+    """刪除允許的 PID"""
+    allowed_pid = db.query(AllowedPid).filter(AllowedPid.id == pid_id).first()
+    if not allowed_pid:
+        raise HTTPException(status_code=404, detail="PID 不存在")
+    
+    db.delete(allowed_pid)
+    db.commit()
+    
+    return {"ok": True, "message": f"已刪除 PID: {allowed_pid.pid}"}
+
+
+# -----------------------------------------------------------------------------
+# ★ 新增：會話管理端點
+# -----------------------------------------------------------------------------
+
+@app.get("/api/admin/chat-sessions")
+def get_chat_sessions(
+    active_only: bool = Query(False, description="只顯示活躍會話"),
+    limit: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
+    """取得聊天會話清單"""
+    query = db.query(ChatSession)
+    if active_only:
+        query = query.filter(ChatSession.is_active == True)
+    
+    sessions = query.order_by(ChatSession.created_at.desc()).limit(limit).all()
+    
+    return {
+        "sessions": [
+            {
+                "id": s.id,
+                "user_id": s.user_id,
+                "user_pid": s.user.pid if s.user else None,
+                "bot_type": s.bot_type,
+                "session_start": s.session_start.isoformat() + "Z",
+                "session_end": s.session_end.isoformat() + "Z" if s.session_end else None,
+                "last_activity": s.last_activity.isoformat() + "Z",
+                "is_active": s.is_active,
+                "end_reason": s.end_reason,
+                "message_count": s.message_count,
+                "duration_minutes": round(s.duration_minutes, 2)
+            } for s in sessions
+        ],
+        "total": len(sessions)
+    }
+
+
+@app.post("/api/admin/chat-sessions/cleanup")
+def cleanup_inactive_sessions(
+    timeout_minutes: int = Query(5, ge=1, le=60, description="超時分鐘數"),
+    db: Session = Depends(get_db),
+):
+    """清理非活躍會話"""
+    ended_count = end_inactive_sessions(db, timeout_minutes)
+    
+    return {
+        "ok": True,
+        "ended_sessions": ended_count,
+        "timeout_minutes": timeout_minutes
+    }
+
+
+@app.get("/api/admin/statistics")
+def get_system_statistics(
+    db: Session = Depends(get_db),
+):
+    """取得系統統計資料"""
+    from sqlalchemy import func as sql_func
+    
+    # 基本統計
+    total_users = db.query(User).count()
+    total_allowed_pids = db.query(AllowedPid).filter(AllowedPid.is_active == True).count()
+    active_sessions = db.query(ChatSession).filter(ChatSession.is_active == True).count()
+    total_messages = db.query(ChatMessage).count()
+    
+    # 今日統計
+    today = datetime.utcnow().date()
+    today_sessions = db.query(ChatSession).filter(
+        sql_func.date(ChatSession.created_at) == today
+    ).count()
+    
+    today_messages = db.query(ChatMessage).filter(
+        sql_func.date(ChatMessage.created_at) == today
+    ).count()
+    
+    # 機器人使用統計
+    bot_usage = db.query(
+        ChatSession.bot_type,
+        sql_func.count(ChatSession.id).label('count')
+    ).group_by(ChatSession.bot_type).all()
+    
+    return {
+        "overview": {
+            "total_users": total_users,
+            "total_allowed_pids": total_allowed_pids,
+            "active_sessions": active_sessions,
+            "total_messages": total_messages
+        },
+        "today": {
+            "new_sessions": today_sessions,
+            "messages_sent": today_messages
+        },
+        "bot_usage": [
+            {"bot_type": usage[0], "session_count": usage[1]} 
+            for usage in bot_usage
         ]
     }
 

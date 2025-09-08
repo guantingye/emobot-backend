@@ -13,7 +13,7 @@ class User(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now())
 
-    # 關聯設定
+    # ★ 修復：使用字符串引用避免循環引用問題
     chat_messages = relationship(
         "ChatMessage",
         back_populates="user",
@@ -37,6 +37,14 @@ class User(Base):
     )
     moods = relationship(
         "MoodRecord", 
+        back_populates="user",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        lazy="select"
+    )
+    # ★ 新增聊天會話關聯
+    chat_sessions = relationship(
+        "ChatSession",
         back_populates="user",
         cascade="all, delete-orphan",
         passive_deletes=True,
