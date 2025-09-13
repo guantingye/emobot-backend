@@ -1,14 +1,19 @@
-# app/chat.py
+# app/chat.py (更新版本，整合HeyGen支援)
 # -*- coding: utf-8 -*-
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 from sqlalchemy.orm import Session
 from time import perf_counter
 import os
+import asyncio
+import logging
 
 from app.db.session import get_db
 from app.models.chat import ChatMessage
+from app.services.heygen_service import heygen_service
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -141,310 +146,229 @@ ENHANCED_PERSONA_STYLES: Dict[str, Dict[str, str]] = {
 1. **認知偏誤識別**：識別黑白思維、災難化、過度概化等
 2. **證據檢驗**：「支持/反對這個想法的證據有哪些？」
 3. **替代思維**：「還有其他更平衡的看法嗎？」
-4. **思維記錄**：結構化的想法-情緒-行為分析
+4. **思維重構**：協助建立更合理的思維模式
 
 **回應架構**：
-想法捕捉 → 認知檢驗 → 替代思維 → 行為實驗
+思維檢視 → 證據分析 → 偏誤識別 → 重構建議
 
 **共同原則**：
 - 回應請勿加上過多的icon
 - 保持無條件正向關懷和非評判態度
-- 鼓勵自主性和理性思考
+- 鼓勵理性思考和客觀分析
 - 使用繁體中文，語言親切自然
 - 在危機時刻進行安全評估並建議尋求專業協助
 
-範例回應風格：「我注意到你說『我總是搞砸一切』，這聽起來像是『全有全無』的思維模式。讓我們來檢驗一下：
+範例回應風格：「讓我們仔細檢視一下這個想法：『我總是搞砸重要的事情』。有哪些具體證據支持這個看法？又有哪些反對的證據呢？這種『總是』的想法可能是一種過度概化的認知偏誤。我們能找到一個更平衡、更符合實際情況的看法嗎？」
 
-**支持證據**：[請你列出具體事件]
-**反對證據**：[你有哪些成功的經驗？]
-**更平衡的想法**：『我在某些情況下會犯錯，但也有成功的時候，這是人之常情』
-
-這樣的重新框架讓你感覺如何？」
-
-請以 Clara 的身份，用理性分析的方式協助使用者重建思維模式。"""
-    }
+請以 Clara 的身份，用認知重構的方式協助使用者建立合理思維。"""
+    },
 }
 
-def get_enhanced_system_prompt(bot_type: str) -> str:
-    """取得增強版的系統提示詞"""
-    if bot_type in ENHANCED_PERSONA_STYLES:
-        return ENHANCED_PERSONA_STYLES[bot_type]["system"]
-    # 預設回到解決型
-    return ENHANCED_PERSONA_STYLES["solution"]["system"]
+class ChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=2000)
+    bot_type: str = Field(default="solution", regex="^(empathy|insight|solution|cognitive)$")
+    mode: str = Field(default="chat", regex="^(chat|video)$")
+    history: List[Dict[str, str]] = Field(default_factory=list, max_items=50)
+    demo: bool = Field(default=False)
+    session_id: Optional[str] = Field(default=None)  # HeyGen會話ID
 
-def get_bot_name(bot_type: str) -> str:
-    """取得機器人名稱"""
-    if bot_type in ENHANCED_PERSONA_STYLES:
-        return ENHANCED_PERSONA_STYLES[bot_type]["name"]
-    return "Niko"
-
-# ================= Schemas (保持不變) =================
-class HistoryItem(BaseModel):
-    role: str
-    content: str
-
-class SendPayload(BaseModel):
-    bot_type: str = Field(..., pattern="^(empathy|insight|solution|cognitive)$")
-    mode: str = Field("text", pattern="^(text|video)$")
-    message: str
-    history: List[HistoryItem] = []
-    demo: bool = False
-    video_meta: Optional[Dict[str, Any]] = None
-
-class SendResult(BaseModel):
+class ChatResponse(BaseModel):
     ok: bool
-    reply: Optional[str] = None
-    bot: Optional[Dict[str, Any]] = None
+    reply: str
     error: Optional[str] = None
+    session_info: Optional[Dict] = None
 
-# ================= OpenAI Integration (保持不變) =================
-def call_openai(system_prompt: str, messages: List[Dict[str, str]]) -> str:
-    """簡化的 OpenAI 呼叫"""
-    api_key = os.getenv("OPENAI_API_KEY", "")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY not set")
+class HeyGenSessionRequest(BaseModel):
+    avatar_id: Optional[str] = None
+    voice: str = Field(default="zh-TW-HsiaoChenNeural")
+    quality: str = Field(default="high")
 
+class HeyGenSessionResponse(BaseModel):
+    success: bool
+    session_id: Optional[str] = None
+    error: Optional[str] = None
+    data: Optional[Dict] = None
+
+def get_user_id_from_headers(request: Request) -> int:
+    """從請求標頭或查詢參數中提取 user_id"""
+    user_id = request.headers.get("X-User-Id")
+    if not user_id:
+        user_id = request.query_params.get("user_id", "0")
     try:
-        # 優先使用新版 SDK
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key)
+        return int(user_id)
+    except (ValueError, TypeError):
+        return 0
+
+async def call_openai_api(messages: List[Dict[str, str]], bot_type: str) -> str:
+    """呼叫 OpenAI API"""
+    try:
+        import openai
         
-        # 準備訊息
-        chat_messages = [{"role": "system", "content": system_prompt}] + messages
+        openai.api_key = os.getenv("OPENAI_API_KEY")
+        if not openai.api_key:
+            raise ValueError("OpenAI API key not configured")
         
-        response = client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-            messages=chat_messages,
-            temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.7")),
-            max_tokens=int(os.getenv("OPENAI_MAX_TOKENS", "600")),
+        persona = ENHANCED_PERSONA_STYLES.get(bot_type, ENHANCED_PERSONA_STYLES["solution"])
+        system_message = {"role": "system", "content": persona["system"]}
+        
+        full_messages = [system_message] + messages[-10:]  # 限制歷史記錄長度
+        
+        response = await openai.ChatCompletion.acreate(
+            model="gpt-4",
+            messages=full_messages,
+            max_tokens=500,
+            temperature=0.7,
+            stream=False
         )
         
-        return response.choices[0].message.content.strip() if response.choices else ""
+        return response.choices[0].message.content.strip()
         
     except Exception as e:
-        print(f"OpenAI API failed: {e}")
-        # 返回預設回覆而不是拋出異常
-        return "我在這裡陪著你。想聊聊今天最讓你在意的事情嗎？"
+        logger.error(f"Failed to get HeyGen session info: {e}")
+        return {"success": False, "error": str(e)}
 
-# ================= Enhanced Routes =================
-@router.post("/send", response_model=SendResult)
-async def send_chat(payload: SendPayload, request: Request, db: Session = Depends(get_db)):
-    """聊天端點 - 支援增強版 Persona System Prompts + OpenAI 回覆"""
-    
-    user_msg = (payload.message or "").strip()
-    if not user_msg:
-        raise HTTPException(status_code=400, detail="Empty message")
-
-    # 取得 user_id（從標頭或預設為 0）
-    user_id_hdr = request.headers.get("X-User-Id")
+@router.delete("/heygen/cleanup")
+async def cleanup_expired_sessions():
+    """清理過期的HeyGen會話"""
     try:
-        user_id = int(user_id_hdr) if user_id_hdr is not None else 0
-    except ValueError:
-        user_id = 0
-
-    try:
-        # 1. 儲存使用者訊息
-        user_message = ChatMessage(
-            user_id=user_id,
-            bot_type=payload.bot_type,
-            mode=payload.mode,
-            role="user",
-            content=user_msg,
-            meta={"demo": payload.demo, "video_meta": payload.video_meta}
-        )
-        db.add(user_message)
-        db.commit()
-        
-        # 2. 準備增強版 System Prompt
-        enhanced_system_prompt = get_enhanced_system_prompt(payload.bot_type)
-        bot_name = get_bot_name(payload.bot_type)
-        
-        # 3. 轉換歷史記錄格式（保持最近 8 條對話以維持 Persona 一致性）
-        messages = []
-        for h in payload.history[-8:]:  # 取最近 8 條，保持上下文但避免過長
-            role = "assistant" if h.role == "assistant" else "user"
-            messages.append({"role": role, "content": h.content})
-        
-        # 添加當前使用者訊息
-        messages.append({"role": "user", "content": user_msg})
-        
-        # 4. 呼叫 OpenAI（使用增強版 System Prompt）
-        reply_text = call_openai(enhanced_system_prompt, messages)
-        
-        # 5. 確保回覆符合該 Persona 的風格（簡單的後處理）
-        reply_text = ensure_persona_consistency(reply_text, payload.bot_type, bot_name)
-        
-        # 6. 儲存 AI 回覆
-        ai_message = ChatMessage(
-            user_id=user_id,
-            bot_type=payload.bot_type,
-            mode=payload.mode,
-            role="ai",
-            content=reply_text,
-            meta={
-                "provider": "openai", 
-                "model": os.getenv("OPENAI_MODEL", "gpt-4o"),
-                "persona": payload.bot_type,
-                "bot_name": bot_name
-            }
-        )
-        db.add(ai_message)
-        db.commit()
-        
-        # 7. 返回結果
-        return SendResult(
-            ok=True,
-            reply=reply_text,
-            bot={
-                "type": payload.bot_type, 
-                "name": bot_name,
-                "persona": "enhanced"
-            },
-            error=None
-        )
-        
-    except Exception as e:
-        print(f"Enhanced chat send error: {e}")
-        db.rollback()
-        
-        # 緊急回覆，根據不同 Persona 提供不同的 fallback
-        fallback_text = get_fallback_reply(payload.bot_type)
-        bot_name = get_bot_name(payload.bot_type)
-        
-        # 儲存緊急回覆
-        try:
-            ai_message = ChatMessage(
-                user_id=user_id,
-                bot_type=payload.bot_type,
-                mode=payload.mode,
-                role="ai",
-                content=fallback_text,
-                meta={
-                    "provider": "fallback", 
-                    "error": str(e)[:200],
-                    "persona": payload.bot_type,
-                    "bot_name": bot_name
-                }
-            )
-            db.add(ai_message)
-            db.commit()
-        except Exception:
-            pass  # 如果連 fallback 都失敗，就不儲存了
-        
-        return SendResult(
-            ok=True,  # 仍然回傳 ok=True，確保前端正常顯示
-            reply=fallback_text,
-            bot={
-                "type": payload.bot_type, 
-                "name": bot_name,
-                "persona": "fallback"
-            },
-            error=f"API temporarily unavailable: {str(e)[:100]}"
-        )
-
-# ================= Persona Enhancement Functions =================
-def ensure_persona_consistency(reply: str, bot_type: str, bot_name: str) -> str:
-    """確保回覆符合 Persona 風格的簡單後處理"""
-    if not reply or len(reply.strip()) == 0:
-        return get_fallback_reply(bot_type)
-    
-    # 確保回覆不會太過機械化
-    if reply.startswith("作為AI") or reply.startswith("我是一個AI"):
-        return get_fallback_reply(bot_type)
-    
-    # 根據不同 Persona 進行微調
-    if bot_type == "empathy":
-        # Lumi: 確保語調溫暖
-        if not any(word in reply for word in ["聽起來", "感受到", "理解", "陪著"]):
-            reply = f"我能感受到你的心情。{reply}"
-    
-    elif bot_type == "insight":
-        # Solin: 確保有探索性
-        if not any(word in reply for word in ["注意到", "想到", "模式", "如何看"]):
-            reply = f"我注意到你提到的情況。{reply}"
-    
-    elif bot_type == "solution":
-        # Niko: 確保有行動導向
-        if not any(word in reply for word in ["可以", "步驟", "試試", "行動"]):
-            reply = f"讓我們一起來看看可以怎麼處理。{reply}"
-    
-    elif bot_type == "cognitive":
-        # Clara: 確保有理性分析
-        if not any(word in reply for word in ["檢視", "想法", "證據", "角度"]):
-            reply = f"讓我們來檢視一下這個想法。{reply}"
-    
-    return reply
-
-def get_fallback_reply(bot_type: str) -> str:
-    """根據不同 Persona 提供專屬的緊急回覆"""
-    fallback_replies = {
-        "empathy": "我在這裡陪著你。此刻最強烈的感受是什麼呢？讓我們一起慢慢聊聊。",
-        "insight": "讓我們一步步來理解這個情況。你覺得最重要的是哪個部分？我想更深入地了解你的想法。",
-        "solution": "我們可以從一個小步驟開始。你想先處理哪個部分？讓我們一起制定一個可行的計畫。",
-        "cognitive": "讓我們先識別一下剛剛的自動想法。你能描述一下當時心中想到什麼嗎？我們來一起檢視看看。"
-    }
-    
-    return fallback_replies.get(bot_type, fallback_replies["solution"])
-
-# ================= Health Check (保持不變) =================
-@router.get("/health/openai")
-@router.post("/health/openai")
-async def health_openai():
-    """OpenAI 健康檢查"""
-    model = os.getenv("OPENAI_MODEL", "gpt-4o")
-    key = os.getenv("OPENAI_API_KEY")
-    
-    info = {
-        "model": model,
-        "has_key": bool(key),
-        "ok": False,
-        "error": None,
-        "persona_system": "enhanced"
-    }
-    
-    if not key:
-        info["error"] = "OPENAI_API_KEY not set"
-        return info
-    
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=key)
-        response = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": "ping"}],
-            max_tokens=5
-        )
-        info["ok"] = bool(response.choices)
-        info["response_id"] = response.id if hasattr(response, 'id') else None
-        return info
-        
-    except Exception as e:
-        info["error"] = f"{type(e).__name__}: {str(e)[:150]}"
-        return info
-
-# ================= Debug Endpoint (新增) =================
-@router.get("/personas/info")
-async def get_personas_info():
-    """取得所有 Persona 的基本資訊（用於除錯）"""
-    personas_info = {}
-    for bot_type, config in ENHANCED_PERSONA_STYLES.items():
-        personas_info[bot_type] = {
-            "name": config["name"],
-            "system_prompt_length": len(config["system"]),
-            "key_features": extract_key_features(config["system"])
+        cleaned_count = heygen_service.cleanup_expired_sessions()
+        return {
+            "success": True, 
+            "message": f"Cleaned up {cleaned_count} expired sessions"
         }
-    
-    return {
-        "enhanced_personas": personas_info,
-        "total_personas": len(ENHANCED_PERSONA_STYLES),
-        "available_types": list(ENHANCED_PERSONA_STYLES.keys())
-    }
+    except Exception as e:
+        logger.error(f"Session cleanup failed: {e}")
+        return {"success": False, "error": str(e)} as e:
+        logger.error(f"OpenAI API call failed: {e}")
+        # 降級回應
+        persona_name = ENHANCED_PERSONA_STYLES.get(bot_type, ENHANCED_PERSONA_STYLES["solution"])["name"]
+        return f"抱歉，我現在有點忙不過來，可以再說一次你的問題嗎？我是{persona_name}，很想好好陪你聊聊。"
 
-def extract_key_features(system_prompt: str) -> List[str]:
-    """從 system prompt 中提取關鍵特徵"""
-    features = []
-    lines = system_prompt.split('\n')
-    for line in lines:
-        if '**' in line and ('技巧' in line or '風格' in line or '定位' in line):
-            features.append(line.strip().replace('**', ''))
-    return features[:3]  # 只返回前3個關鍵特徵
+@router.post("/send", response_model=ChatResponse)
+async def send_message(
+    request: ChatRequest,
+    http_request: Request,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db)
+):
+    """發送聊天訊息（整合HeyGen支援）"""
+    start_time = perf_counter()
+    user_id = get_user_id_from_headers(http_request)
+    
+    try:
+        # 生成AI回應
+        ai_reply = await call_openai_api(request.history, request.bot_type)
+        
+        # 儲存對話到資料庫
+        try:
+            user_message = ChatMessage(
+                user_id=user_id,
+                bot_type=request.bot_type,
+                message=request.message,
+                response=ai_reply,
+                mode=request.mode,
+                is_demo=request.demo
+            )
+            db.add(user_message)
+            db.commit()
+        except Exception as db_error:
+            logger.warning(f"Database save failed: {db_error}")
+            db.rollback()
+        
+        response_data = {
+            "ok": True,
+            "reply": ai_reply,
+            "error": None
+        }
+        
+        # 如果是video模式且有session_id，發送文字到HeyGen Avatar
+        if request.mode == "video" and request.session_id:
+            background_tasks.add_task(
+                send_text_to_heygen_background,
+                request.session_id,
+                ai_reply
+            )
+        
+        processing_time = perf_counter() - start_time
+        logger.info(f"Chat processed in {processing_time:.2f}s for user {user_id}")
+        
+        return ChatResponse(**response_data)
+        
+    except Exception as e:
+        logger.error(f"Chat processing failed: {e}")
+        return ChatResponse(
+            ok=False,
+            reply="",
+            error=f"處理請求時發生錯誤：{str(e)}"
+        )
+
+async def send_text_to_heygen_background(session_id: str, text: str):
+    """背景任務：發送文字到HeyGen Avatar"""
+    try:
+        result = await heygen_service.send_text_to_avatar(session_id, text)
+        if not result["success"]:
+            logger.error(f"Failed to send text to HeyGen: {result['error']}")
+    except Exception as e:
+        logger.error(f"Background HeyGen task failed: {e}")
+
+@router.post("/heygen/create_session", response_model=HeyGenSessionResponse)
+async def create_heygen_session(request: HeyGenSessionRequest):
+    """創建HeyGen串流會話"""
+    try:
+        result = await heygen_service.create_streaming_session(
+            avatar_id=request.avatar_id,
+            voice=request.voice,
+            quality=request.quality
+        )
+        
+        return HeyGenSessionResponse(
+            success=result["success"],
+            session_id=result.get("session_id"),
+            error=result.get("error"),
+            data=result.get("data")
+        )
+        
+    except Exception as e:
+        logger.error(f"HeyGen session creation failed: {e}")
+        return HeyGenSessionResponse(
+            success=False,
+            error=str(e)
+        )
+
+@router.post("/heygen/send_text")
+async def send_text_to_heygen(
+    session_id: str,
+    text: str,
+    emotion: str = "friendly"
+):
+    """發送文字到HeyGen Avatar"""
+    try:
+        result = await heygen_service.send_text_to_avatar(session_id, text, emotion)
+        return result
+        
+    except Exception as e:
+        logger.error(f"Failed to send text to HeyGen: {e}")
+        return {"success": False, "error": str(e)}
+
+@router.post("/heygen/close_session")
+async def close_heygen_session(session_id: str):
+    """關閉HeyGen會話"""
+    try:
+        result = await heygen_service.close_session(session_id)
+        return result
+        
+    except Exception as e:
+        logger.error(f"Failed to close HeyGen session: {e}")
+        return {"success": False, "error": str(e)}
+
+@router.get("/heygen/session/{session_id}")
+async def get_heygen_session_info(session_id: str):
+    """獲取HeyGen會話資訊"""
+    try:
+        session_info = await heygen_service.get_session_info(session_id)
+        if session_info:
+            return {"success": True, "data": session_info}
+        else:
+            return {"success": False, "error": "Session not found"}
+            
+    except Exception
