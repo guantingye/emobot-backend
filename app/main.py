@@ -29,6 +29,9 @@ from app.models.mood import MoodRecord
 from app.models.allowed_pid import AllowedPid
 from app.models.chat_session import ChatSession
 
+# *** 新增：導入 chat 路由 ***
+from app.chat import router as chat_router
+
 # ---- Optional: 外部推薦引擎，失敗時走 fallback ----
 try:
     from app.services.recommendation_engine import recommend_endpoint_payload as _build_reco
@@ -169,6 +172,10 @@ def on_startup():
     Base.metadata.create_all(bind=engine)
 
 
+# *** 新增：註冊 chat 路由 ***
+app.include_router(chat_router)
+
+
 # -----------------------------------------------------------------------------
 # Schemas
 # -----------------------------------------------------------------------------
@@ -244,9 +251,9 @@ def get_system_prompt(bot_type: str) -> str:
     """取得不同 AI 類型的系統提示"""
     prompts = {
         "empathy": "你是 Lumi，同理型 AI。以溫柔、非評判、短句的反映傾聽與情緒標記來回應。優先肯認、共感與陪伴。用繁體中文回覆，保持溫暖支持的語調。",
-        "insight": "你是 Solin，洞察型 AI。以蘇格拉底式提問、澄清與重述，幫助使用者釐清想法，維持中性、尊重、結構化。用繁體中文回覆。",
+        "insight": "你是 Solin，洞察型 AI。以蘇格拉底式提問、澄清與重述，幫助使用者澄清想法，維持中性、尊重、結構化。用繁體中文回覆。",
         "solution": "你是 Niko，解決型 AI。以務實、具體的建議與分步行動為主，給出小目標、工具與下一步，語氣鼓勵但不強迫。用繁體中文回覆。",
-        "cognitive": "你是 Clara，認知型 AI。以 CBT 語氣幫助辨識自動想法、認知偏誤與替代想法，提供簡短表格式步驟與練習。用繁體中文回覆。"
+        "cognitive": "你是 Clara，認知型 AI。以 CBT 語氣協助辨識自動想法、認知偏誤與替代想法，提供簡短表格式步驟與練習。用繁體中文回覆。"
     }
     return prompts.get(bot_type, prompts["solution"])
 
@@ -374,7 +381,12 @@ def update_session_activity(user_id: int, db: Session):
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "time": datetime.utcnow().isoformat() + "Z"}
+    return {
+        "ok": True, 
+        "time": datetime.utcnow().isoformat() + "Z",
+        "chat_router_registered": True,  # *** 新增：確認chat路由已註冊 ***
+        "heygen_enabled": bool(os.getenv("HEYGEN_API_KEY"))  # *** 新增：HeyGen狀態 ***
+    }
 
 
 @app.get("/api/debug/db-test")
@@ -729,414 +741,3 @@ def chat_send(
     except Exception as e:
         print(f"Chat send error: {e}")
         db.rollback()
-        
-        # 緊急回覆，確保使用者體驗
-        fallback_replies = {
-            "empathy": "我在這裡陪著你。此刻最強烈的感受是什麼？",
-            "insight": "讓我們一步步來理解這個情況。你覺得最重要的是哪個部分？",
-            "solution": "我們可以從一個小步驟開始。你想先處理哪個部分？",
-            "cognitive": "讓我們先識別一下剛剛的自動想法。你能描述一下當時心中想到什麼嗎？"
-        }
-        
-        fallback_text = fallback_replies.get(bot_type, fallback_replies["solution"])
-        
-        # 儲存緊急回覆
-        try:
-            ai_message = ChatMessage(
-                user_id=user_id,
-                bot_type=bot_type,
-                mode=body.mode or "text",
-                role="ai",
-                content=fallback_text,
-                meta={"provider": "fallback", "error": str(e)[:200]}
-            )
-            db.add(ai_message)
-            db.commit()
-        except Exception:
-            pass  # 如果連 fallback 都失敗，就不儲存了
-        
-        # ✅ 修復：即使出錯也要返回正確格式
-        return {
-            "ok": True,  # 仍然回傳 ok=True，確保前端正常顯示
-            "reply": fallback_text,
-            "bot": {
-                "type": bot_type, 
-                "name": get_bot_name(bot_type)
-            },
-            "error": f"API temporarily unavailable: {str(e)[:100]}"
-        }
-
-
-# ★ 新增：結束聊天會話端點
-@app.post("/api/chat/session/end")
-def end_chat_session(
-    body: ChatSessionEnd,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """手動結束聊天會話"""
-    active_session = db.query(ChatSession).filter(
-        ChatSession.user_id == user.id,
-        ChatSession.is_active == True
-    ).first()
-    
-    if not active_session:
-        raise HTTPException(status_code=404, detail="沒有找到活躍的聊天會話")
-    
-    active_session.is_active = False
-    active_session.session_end = datetime.utcnow()
-    active_session.end_reason = body.reason
-    db.add(active_session)
-    db.commit()
-    
-    return {
-        "ok": True,
-        "session_id": active_session.id,
-        "duration_minutes": round(active_session.duration_minutes, 2),
-        "message_count": active_session.message_count
-    }
-
-
-@app.post("/api/chat/messages")
-def save_chat_message(
-    body: ChatMessageCreate,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    if body.role not in ("user", "ai"):
-        raise HTTPException(status_code=422, detail="role must be 'user' or 'ai'")
-
-    msg = ChatMessage(
-        user_id=user.id,
-        bot_type=body.bot_type or (user.selected_bot or "empathy"),
-        mode=body.mode or "text",
-        role=body.role,
-        content=body.content,
-        created_at=datetime.utcnow(),
-        meta={"user_mood": body.user_mood, "mood_intensity": body.mood_intensity},
-    )
-    db.add(msg)
-    db.commit()
-    db.refresh(msg)
-    return {"ok": True, "id": msg.id, "created_at": msg.created_at.isoformat() + "Z"}
-
-
-@app.get("/api/chat/messages")
-def get_chat_messages(
-    limit: int = Query(50, ge=1, le=200),
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    rows = (
-        db.query(ChatMessage)
-        .filter(ChatMessage.user_id == user.id)
-        .order_by(ChatMessage.id.desc())
-        .limit(limit)
-        .all()
-    )
-    out = [
-        {
-            "id": r.id,
-            "bot_type": r.bot_type,
-            "mode": r.mode,
-            "role": r.role,
-            "content": r.content,
-            "created_at": r.created_at.isoformat() + "Z",
-            "meta": r.meta,
-        }
-        for r in rows[::-1]
-    ]
-    return {"messages": out}
-
-
-# -----------------------------------------------------------------------------
-# Mood Records
-# -----------------------------------------------------------------------------
-
-@app.post("/api/mood/records")
-def create_mood(
-    body: MoodRecordCreate,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    rec = MoodRecord(
-        user_id=user.id,
-        mood=body.mood,
-        intensity=body.intensity,
-        note=body.note,
-        created_at=datetime.utcnow(),
-    )
-    db.add(rec)
-    db.commit()
-    db.refresh(rec)
-    return {"ok": True, "id": rec.id, "created_at": rec.created_at.isoformat() + "Z"}
-
-
-@app.get("/api/mood/records")
-def list_mood(
-    days: int = Query(30, ge=1, le=365),
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    since = datetime.utcnow() - timedelta(days=days)
-    rows = (
-        db.query(MoodRecord)
-        .filter(and_(MoodRecord.user_id == user.id, MoodRecord.created_at >= since))
-        .order_by(MoodRecord.id.desc())
-        .all()
-    )
-    return {
-        "records": [
-            {
-                "id": r.id,
-                "mood": r.mood,
-                "intensity": r.intensity,
-                "note": r.note,
-                "created_at": r.created_at.isoformat() + "Z",
-            }
-            for r in rows[::-1]
-        ]
-    }
-
-
-# -----------------------------------------------------------------------------
-# ★ 新增：PID 管理端點
-# -----------------------------------------------------------------------------
-
-@app.post("/api/admin/allowed-pids")
-def create_allowed_pid(
-    body: AllowedPidCreate,
-    db: Session = Depends(get_db),
-):
-    """新增允許的 PID（需要管理員權限）"""
-    # 檢查是否已存在
-    existing = db.query(AllowedPid).filter(AllowedPid.pid == body.pid).first()
-    if existing:
-        raise HTTPException(status_code=409, detail="此 PID 已存在")
-    
-    allowed_pid = AllowedPid(
-        pid=body.pid,
-        description=body.description,
-        is_active=True
-    )
-    db.add(allowed_pid)
-    db.commit()
-    db.refresh(allowed_pid)
-    
-    return {
-        "ok": True,
-        "id": allowed_pid.id,
-        "pid": allowed_pid.pid,
-        "description": allowed_pid.description,
-        "is_active": allowed_pid.is_active,
-        "created_at": allowed_pid.created_at.isoformat() + "Z"
-    }
-
-
-@app.get("/api/admin/allowed-pids")
-def get_allowed_pids(
-    active_only: bool = Query(True, description="只顯示啟用的 PID"),
-    db: Session = Depends(get_db),
-):
-    """取得允許的 PID 清單"""
-    query = db.query(AllowedPid)
-    if active_only:
-        query = query.filter(AllowedPid.is_active == True)
-    
-    pids = query.order_by(AllowedPid.created_at.desc()).all()
-    
-    return {
-        "pids": [
-            {
-                "id": p.id,
-                "pid": p.pid,
-                "description": p.description,
-                "is_active": p.is_active,
-                "created_at": p.created_at.isoformat() + "Z",
-                "updated_at": p.updated_at.isoformat() + "Z"
-            } for p in pids
-        ],
-        "total": len(pids)
-    }
-
-
-@app.put("/api/admin/allowed-pids/{pid_id}")
-def update_allowed_pid(
-    pid_id: int,
-    body: AllowedPidUpdate,
-    db: Session = Depends(get_db),
-):
-    """更新允許的 PID"""
-    allowed_pid = db.query(AllowedPid).filter(AllowedPid.id == pid_id).first()
-    if not allowed_pid:
-        raise HTTPException(status_code=404, detail="PID 不存在")
-    
-    if body.is_active is not None:
-        allowed_pid.is_active = body.is_active
-    if body.description is not None:
-        allowed_pid.description = body.description
-    
-    db.add(allowed_pid)
-    db.commit()
-    
-    return {
-        "ok": True,
-        "id": allowed_pid.id,
-        "pid": allowed_pid.pid,
-        "description": allowed_pid.description,
-        "is_active": allowed_pid.is_active
-    }
-
-
-@app.delete("/api/admin/allowed-pids/{pid_id}")
-def delete_allowed_pid(
-    pid_id: int,
-    db: Session = Depends(get_db),
-):
-    """刪除允許的 PID"""
-    allowed_pid = db.query(AllowedPid).filter(AllowedPid.id == pid_id).first()
-    if not allowed_pid:
-        raise HTTPException(status_code=404, detail="PID 不存在")
-    
-    db.delete(allowed_pid)
-    db.commit()
-    
-    return {"ok": True, "message": f"已刪除 PID: {allowed_pid.pid}"}
-
-
-# -----------------------------------------------------------------------------
-# ★ 新增：會話管理端點
-# -----------------------------------------------------------------------------
-
-@app.get("/api/admin/chat-sessions")
-def get_chat_sessions(
-    active_only: bool = Query(False, description="只顯示活躍會話"),
-    limit: int = Query(50, ge=1, le=200),
-    db: Session = Depends(get_db),
-):
-    """取得聊天會話清單"""
-    query = db.query(ChatSession)
-    if active_only:
-        query = query.filter(ChatSession.is_active == True)
-    
-    sessions = query.order_by(ChatSession.created_at.desc()).limit(limit).all()
-    
-    return {
-        "sessions": [
-            {
-                "id": s.id,
-                "user_id": s.user_id,
-                "user_pid": s.user.pid if s.user else None,
-                "bot_type": s.bot_type,
-                "session_start": s.session_start.isoformat() + "Z",
-                "session_end": s.session_end.isoformat() + "Z" if s.session_end else None,
-                "last_activity": s.last_activity.isoformat() + "Z",
-                "is_active": s.is_active,
-                "end_reason": s.end_reason,
-                "message_count": s.message_count,
-                "duration_minutes": round(s.duration_minutes, 2)
-            } for s in sessions
-        ],
-        "total": len(sessions)
-    }
-
-
-@app.post("/api/admin/chat-sessions/cleanup")
-def cleanup_inactive_sessions(
-    timeout_minutes: int = Query(5, ge=1, le=60, description="超時分鐘數"),
-    db: Session = Depends(get_db),
-):
-    """清理非活躍會話"""
-    ended_count = end_inactive_sessions(db, timeout_minutes)
-    
-    return {
-        "ok": True,
-        "ended_sessions": ended_count,
-        "timeout_minutes": timeout_minutes
-    }
-
-
-@app.get("/api/admin/statistics")
-def get_system_statistics(
-    db: Session = Depends(get_db),
-):
-    """取得系統統計資料"""
-    from sqlalchemy import func as sql_func
-    
-    # 基本統計
-    total_users = db.query(User).count()
-    total_allowed_pids = db.query(AllowedPid).filter(AllowedPid.is_active == True).count()
-    active_sessions = db.query(ChatSession).filter(ChatSession.is_active == True).count()
-    total_messages = db.query(ChatMessage).count()
-    
-    # 今日統計
-    today = datetime.utcnow().date()
-    today_sessions = db.query(ChatSession).filter(
-        sql_func.date(ChatSession.created_at) == today
-    ).count()
-    
-    today_messages = db.query(ChatMessage).filter(
-        sql_func.date(ChatMessage.created_at) == today
-    ).count()
-    
-    # 機器人使用統計
-    bot_usage = db.query(
-        ChatSession.bot_type,
-        sql_func.count(ChatSession.id).label('count')
-    ).group_by(ChatSession.bot_type).all()
-    
-    return {
-        "overview": {
-            "total_users": total_users,
-            "total_allowed_pids": total_allowed_pids,
-            "active_sessions": active_sessions,
-            "total_messages": total_messages
-        },
-        "today": {
-            "new_sessions": today_sessions,
-            "messages_sent": today_messages
-        },
-        "bot_usage": [
-            {"bot_type": usage[0], "session_count": usage[1]} 
-            for usage in bot_usage
-        ]
-    }
-
-
-# -----------------------------------------------------------------------------
-# OpenAI Health Check
-# -----------------------------------------------------------------------------
-
-@app.get("/api/chat/health/openai")
-@app.post("/api/chat/health/openai")
-async def health_openai():
-    """OpenAI 健康檢查"""
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    key = os.getenv("OPENAI_API_KEY")
-    
-    info = {
-        "model": model,
-        "has_key": bool(key),
-        "ok": False,
-        "error": None
-    }
-    
-    if not key:
-        info["error"] = "OPENAI_API_KEY not set"
-        return info
-    
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=key)
-        response = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": "ping"}],
-            max_tokens=5
-        )
-        info["ok"] = bool(response.choices)
-        info["response_id"] = response.id if hasattr(response, 'id') else None
-        return info
-        
-    except Exception as e:
-        info["error"] = f"{type(e).__name__}: {str(e)[:150]}"
-        return info
