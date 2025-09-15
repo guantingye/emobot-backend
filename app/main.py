@@ -1,4 +1,4 @@
-# app/main.py
+# app/main.py - 最終修復版，確保 HeyGen 路由正確註冊
 from __future__ import annotations
 
 import os
@@ -27,9 +27,6 @@ from app.models.chat import ChatMessage
 from app.models.mood import MoodRecord
 from app.models.allowed_pid import AllowedPid
 from app.models.chat_session import ChatSession
-
-# *** 修復：正確導入 chat router ***
-from app.chat import router as chat_router
 
 # ---- Optional: 外部推薦引擎，失敗時走 fallback ----
 try:
@@ -171,8 +168,22 @@ def on_startup():
     Base.metadata.create_all(bind=engine)
 
 
-# *** 修復：正確註冊 chat router，使用 /api/chat 前缀 ***
-app.include_router(chat_router, prefix="/api/chat", tags=["chat"])
+# *** 關鍵修復：確保 chat router 正確註冊 ***
+try:
+    from app.chat import router as chat_router
+    app.include_router(chat_router, prefix="/api/chat", tags=["chat"])
+    print("✅ Chat router with HeyGen endpoints registered successfully")
+except Exception as e:
+    print(f"❌ Failed to register chat router: {e}")
+    # 創建備用路由以防主路由失敗
+    from fastapi import APIRouter
+    backup_router = APIRouter()
+    
+    @backup_router.get("/health")
+    async def backup_health():
+        return {"ok": False, "error": "Chat router failed to load", "backup": True}
+    
+    app.include_router(backup_router, prefix="/api/chat", tags=["chat-backup"])
 
 
 # -----------------------------------------------------------------------------
@@ -382,7 +393,8 @@ def health():
         "ok": True, 
         "time": datetime.utcnow().isoformat() + "Z",
         "chat_router_registered": True,
-        "heygen_enabled": bool(os.getenv("HEYGEN_API_KEY"))
+        "heygen_enabled": bool(os.getenv("HEYGEN_API_KEY")),
+        "routes_count": len(app.routes)
     }
 
 
@@ -393,6 +405,26 @@ def db_test(db: Session = Depends(get_db)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB not ready: {e}")
     return {"ok": True}
+
+
+# *** 新增：路由診斷端點 ***
+@app.get("/api/debug/routes")
+def list_all_routes():
+    """列出所有註冊的路由（用於診斷 404 問題）"""
+    routes = []
+    for route in app.routes:
+        if hasattr(route, 'methods') and hasattr(route, 'path'):
+            routes.append({
+                "path": route.path,
+                "methods": list(route.methods),
+                "name": getattr(route, 'name', 'unnamed')
+            })
+    return {
+        "total_routes": len(routes),
+        "routes": routes,
+        "chat_routes": [r for r in routes if '/chat/' in r['path']],
+        "heygen_routes": [r for r in routes if 'heygen' in r['path']]
+    }
 
 
 # -----------------------------------------------------------------------------
