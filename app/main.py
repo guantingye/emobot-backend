@@ -25,11 +25,10 @@ from app.models.assessment import Assessment
 from app.models.recommendation import Recommendation
 from app.models.chat import ChatMessage
 from app.models.mood import MoodRecord
-# ★ 新增 import
 from app.models.allowed_pid import AllowedPid
 from app.models.chat_session import ChatSession
 
-# *** 新增：導入 chat 路由 ***
+# *** 修復：正確導入 chat router ***
 from app.chat import router as chat_router
 
 # ---- Optional: 外部推薦引擎，失敗時走 fallback ----
@@ -172,8 +171,8 @@ def on_startup():
     Base.metadata.create_all(bind=engine)
 
 
-# *** 新增：註冊 chat 路由 ***
-app.include_router(chat_router)
+# *** 修復：正確註冊 chat router，使用 /api/chat 前缀 ***
+app.include_router(chat_router, prefix="/api/chat", tags=["chat"])
 
 
 # -----------------------------------------------------------------------------
@@ -224,7 +223,6 @@ class MoodRecordCreate(BaseModel):
     note: Optional[str] = None
 
 
-# ★ 新增 Pydantic 模型
 class AllowedPidCreate(BaseModel):
     pid: str = Field(..., min_length=1, max_length=50)
     description: Optional[str] = Field(default=None, max_length=200)
@@ -297,7 +295,6 @@ def call_openai(system_prompt: str, messages: List[Dict[str, str]]) -> str:
         return "我在這裡陪著你。想聊聊今天最讓你在意的事情嗎？"
 
 
-# ★ 新增輔助函數
 def is_pid_allowed(pid: str, db: Session) -> bool:
     """檢查 PID 是否在允許清單中且為啟用狀態"""
     allowed_pid = db.query(AllowedPid).filter(
@@ -384,8 +381,8 @@ def health():
     return {
         "ok": True, 
         "time": datetime.utcnow().isoformat() + "Z",
-        "chat_router_registered": True,  # *** 新增：確認chat路由已註冊 ***
-        "heygen_enabled": bool(os.getenv("HEYGEN_API_KEY"))  # *** 新增：HeyGen狀態 ***
+        "chat_router_registered": True,
+        "heygen_enabled": bool(os.getenv("HEYGEN_API_KEY"))
     }
 
 
@@ -407,7 +404,7 @@ def _auth_join(body: JoinRequest, db: Session):
     if not pid:
         raise HTTPException(status_code=422, detail="pid is required")
 
-    # ★ 新增：檢查 PID 是否在允許清單中
+    # 檢查 PID 是否在允許清單中
     if not is_pid_allowed(pid, db):
         raise HTTPException(
             status_code=403, 
@@ -670,10 +667,10 @@ def chat_send(
     bot_type = body.bot_type or user.selected_bot or "solution"
 
     try:
-        # ★ 新增：先清理非活躍會話
+        # 先清理非活躍會話
         end_inactive_sessions(db)
         
-        # ★ 新增：取得或建立聊天會話
+        # 取得或建立聊天會話
         chat_session = get_or_create_active_session(user_id, bot_type, db)
 
         # 1. 儲存使用者訊息
@@ -683,12 +680,12 @@ def chat_send(
             mode=body.mode or "text",
             role="user",
             content=user_msg,
-            meta={"demo": body.demo, "session_id": chat_session.id}  # ★ 新增會話 ID
+            meta={"demo": body.demo, "session_id": chat_session.id}
         )
         db.add(user_message)
         db.commit()
         
-        # ★ 新增：更新會話活動
+        # 更新會話活動
         update_session_activity(user_id, db)
         
         # 2. 準備 OpenAI 請求
@@ -716,13 +713,13 @@ def chat_send(
             meta={
                 "provider": "openai", 
                 "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-                "session_id": chat_session.id  # ★ 新增會話 ID
+                "session_id": chat_session.id
             }
         )
         db.add(ai_message)
         db.commit()
         
-        # ★ 新增：再次更新會話活動（AI 回覆也算活動）
+        # 再次更新會話活動（AI 回覆也算活動）
         update_session_activity(user_id, db)
         
         # 5. 返回結果（修復：確保包含 ok 欄位）
@@ -734,10 +731,20 @@ def chat_send(
                 "name": get_bot_name(bot_type)
             },
             "message_id": ai_message.id,
-            "session_id": chat_session.id,  # ★ 新增會話資訊
+            "session_id": chat_session.id,
             "error": None
         }
         
     except Exception as e:
         print(f"Chat send error: {e}")
         db.rollback()
+        # 回傳錯誤但仍標記為成功，讓前端能正常處理
+        return {
+            "ok": False,
+            "reply": "抱歉，我暫時無法回應。請稍後再試。",
+            "bot": {
+                "type": bot_type,
+                "name": get_bot_name(bot_type)
+            },
+            "error": str(e)[:100]
+        }
