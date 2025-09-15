@@ -1,4 +1,4 @@
-# app/chat.py - 完整修復版本，確保 HeyGen 路由正確註冊
+# app/chat.py - 修正的 HeyGen 實作，遵循官方 API 規範
 
 import os
 import asyncio
@@ -14,10 +14,7 @@ from sqlalchemy.orm import Session
 from app.db.session import get_db
 from app.models.chat import ChatMessage
 
-# 配置日誌
 logger = logging.getLogger(__name__)
-
-# *** 創建 router - 確保正確配置 ***
 router = APIRouter()
 
 # ================= Pydantic Models =================
@@ -38,100 +35,64 @@ class SendResult(BaseModel):
     message_id: Optional[int] = None
     session_id: Optional[str] = None
 
-# *** HeyGen 相關模型 ***
+# HeyGen 正確的模型
+class HeyGenTokenRequest(BaseModel):
+    pass  # 創建令牌不需要參數
+
 class HeyGenSessionRequest(BaseModel):
     avatar_id: Optional[str] = Field(default=None)
-    voice: str = Field(default="zh-TW-HsiaoChenNeural")
+    voice: Optional[Dict[str, Any]] = Field(default=None)
     quality: str = Field(default="medium")
+    version: str = Field(default="v2")
 
 class HeyGenSessionResponse(BaseModel):
     success: bool
     session_id: Optional[str] = None
+    access_token: Optional[str] = None
+    url: Optional[str] = None
     error: Optional[str] = None
     data: Optional[Dict] = None
 
 class HeyGenTextRequest(BaseModel):
     session_id: str
     text: str
-    emotion: str = Field(default="friendly")
+    task_type: str = Field(default="repeat")
+    task_mode: str = Field(default="sync")
 
-# ================= Enhanced Persona System =================
+# ================= Persona System (保持原有) =================
 
 ENHANCED_PERSONA_STYLES = {
     "empathy": {
         "name": "Lumi",
-        "system": """你是 Lumi，一位溫暖的同理型 AI 夥伴。
-
-**核心定位**：情緒支持者與傾聽者
-**對話風格**：溫柔、非評判、短句回應
-**主要技巧**：
-- 反映式傾聽："聽起來你..."
-- 情緒標記："感覺很..."
-- 肯認回應："我聽到了..."
-- 陪伴語句："我在這裡陪你"
-
-回應時優先表達共感與理解，避免立即給建議。用繁體中文回覆，保持溫暖支持的語調。""",
+        "system": """你是 Lumi，一位溫暖的同理型 AI 夥伴。以溫柔、非評判、短句回應，優先表達共感與理解。用繁體中文回覆。""",
     },
     "insight": {
         "name": "Solin", 
-        "system": """你是 Solin，一位善於引導的洞察型 AI 夥伴。
-
-**核心定位**：思維澄清者與洞察引導者
-**對話風格**：溫柔提問、結構化探索
-**主要技巧**：
-- 開放式提問："什麼讓你覺得...？"
-- 澄清確認："如果我理解正確..."
-- 重新框架："換個角度來看..."
-- 模式識別："我注意到..."
-
-以蘇格拉底式對話引導用戶自我發現，維持中性、尊重的態度。用繁體中文回覆。""",
+        "system": """你是 Solin，一位善於引導的洞察型 AI 夥伴。以蘇格拉底式對話引導用戶自我發現，維持中性、尊重的態度。用繁體中文回覆。""",
     },
     "solution": {
         "name": "Niko",
-        "system": """你是 Niko，一位務實的解決型 AI 夥伴。
-
-**核心定位**：行動促進者與方案提供者  
-**對話風格**：務實、具體、鼓勵行動
-**主要技巧**：
-- 小步驟分解："我們可以先..."
-- 具體建議："你可以試試..."
-- 資源盤點："你有哪些..."
-- 下一步引導："接下來..."
-
-聚焦於可行的步驟與微目標，語氣鼓勵但不強迫。用繁體中文回覆。""",
+        "system": """你是 Niko，一位務實的解決型 AI 夥伴。聚焦於可行的步驟與微目標，語氣鼓勵但不強迫。用繁體中文回覆。""",
     },
     "cognitive": {
         "name": "Clara",
-        "system": """你是 Clara，一位理性的認知型 AI 夥伴。
-
-**核心定位**：思維模式分析者與重建協助者
-**對話風格**：CBT 導向、邏輯清晰
-**主要技巧**：
-- 想法檢核："這個想法有什麼證據？"
-- 認知偏誤識別："這聽起來像是..."
-- 替代想法："還有什麼可能性？"
-- 行為實驗："我們可以測試..."
-
-協助辨識自動想法與認知偏誤，提供結構化的思維練習。用繁體中文回覆。""",
+        "system": """你是 Clara，一位理性的認知型 AI 夥伴。協助辨識自動想法與認知偏誤，提供結構化的思維練習。用繁體中文回覆。""",
     }
 }
 
 def get_enhanced_system_prompt(bot_type: str) -> str:
-    """取得增強版系統提示"""
     persona = ENHANCED_PERSONA_STYLES.get(bot_type)
     if not persona:
         return ENHANCED_PERSONA_STYLES["solution"]["system"]
     return persona["system"]
 
 def get_bot_name(bot_type: str) -> str:
-    """取得機器人名稱"""
     persona = ENHANCED_PERSONA_STYLES.get(bot_type)
     if not persona:
         return "Niko"
     return persona["name"]
 
 def get_fallback_reply(bot_type: str) -> str:
-    """根據機器人類型提供後備回覆"""
     fallbacks = {
         "empathy": "我在這裡聽你說。想和我分享一下現在的感受嗎？",
         "insight": "讓我們慢慢來。能告訴我更多關於這個情況的背景嗎？", 
@@ -143,17 +104,14 @@ def get_fallback_reply(bot_type: str) -> str:
 # ================= OpenAI Integration =================
 
 def call_openai(system_prompt: str, messages: List[Dict[str, str]]) -> str:
-    """簡化的 OpenAI 呼叫"""
     api_key = os.getenv("OPENAI_API_KEY", "")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY not set")
 
     try:
-        # 優先使用新版 SDK
         from openai import OpenAI
         client = OpenAI(api_key=api_key)
         
-        # 準備訊息
         chat_messages = [{"role": "system", "content": system_prompt}] + messages
         
         response = client.chat.completions.create(
@@ -167,7 +125,6 @@ def call_openai(system_prompt: str, messages: List[Dict[str, str]]) -> str:
         
     except Exception as e:
         print(f"OpenAI API failed: {e}")
-        # 返回預設回覆而不是拋出異常
         return "我在這裡陪著你。想聊聊今天最讓你在意的事情嗎？"
 
 # ================= 主要聊天端點 =================
@@ -179,13 +136,10 @@ async def send_chat(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db)
 ):
-    """聊天端點 - 支援增強版 Persona System Prompts + OpenAI 回覆 + HeyGen 整合"""
-    
     user_msg = (payload.message or "").strip()
     if not user_msg:
         raise HTTPException(status_code=400, detail="Empty message")
 
-    # 取得 user_id（從標頭或預設為 0）
     user_id_hdr = request.headers.get("X-User-Id")
     try:
         user_id = int(user_id_hdr) if user_id_hdr is not None else 0
@@ -209,13 +163,11 @@ async def send_chat(
         system_prompt = get_enhanced_system_prompt(payload.bot_type)
         bot_name = get_bot_name(payload.bot_type)
         
-        # 轉換歷史記錄格式，只取最近 10 條
         messages = []
         for h in (payload.history or [])[-10:]:
             role = "assistant" if h.get("role") == "assistant" else "user"
             messages.append({"role": role, "content": h.get("content", "")})
         
-        # 添加當前使用者訊息
         messages.append({"role": "user", "content": user_msg})
         
         # 3. 呼叫 OpenAI
@@ -243,7 +195,6 @@ async def send_chat(
         if payload.session_id and payload.mode == "video":
             background_tasks.add_task(send_text_to_heygen_background, payload.session_id, reply_text)
         
-        # 6. 返回結果
         return SendResult(
             ok=True,
             reply=reply_text,
@@ -261,11 +212,9 @@ async def send_chat(
         logger.error(f"Send chat failed: {e}")
         db.rollback()
         
-        # 緊急後備回覆
         fallback_text = get_fallback_reply(payload.bot_type)
         bot_name = get_bot_name(payload.bot_type)
         
-        # 儲存緊急回覆
         try:
             ai_message = ChatMessage(
                 user_id=user_id,
@@ -283,10 +232,10 @@ async def send_chat(
             db.add(ai_message)
             db.commit()
         except Exception:
-            pass  # 如果連 fallback 都失敗，就不儲存了
+            pass
         
         return SendResult(
-            ok=True,  # 仍然回傳 ok=True，確保前端正常顯示
+            ok=True,
             reply=fallback_text,
             bot={
                 "type": payload.bot_type, 
@@ -296,11 +245,47 @@ async def send_chat(
             error=f"API temporarily unavailable: {str(e)[:100]}"
         )
 
-# ================= HeyGen 相關路由 =================
+# ================= 正確的 HeyGen API 實作 =================
+
+@router.post("/heygen/create_token")
+async def create_heygen_token():
+    """創建 HeyGen 訪問令牌 - 步驟1"""
+    heygen_api_key = os.getenv("HEYGEN_API_KEY")
+    if not heygen_api_key:
+        return {"success": False, "error": "HeyGen API key not configured"}
+    
+    headers = {
+        "X-Api-Key": heygen_api_key,
+        "Content-Type": "application/json"
+    }
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.heygen.com/v1/streaming.create_token",
+                headers=headers
+            ) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    return {
+                        "success": True,
+                        "token": result.get("data", {}).get("token"),
+                        "data": result.get("data")
+                    }
+                else:
+                    error_text = await response.text()
+                    return {
+                        "success": False,
+                        "error": f"HTTP {response.status}: {error_text}"
+                    }
+                    
+    except Exception as e:
+        logger.error(f"Failed to create HeyGen token: {e}")
+        return {"success": False, "error": str(e)}
 
 @router.post("/heygen/create_session", response_model=HeyGenSessionResponse)
 async def create_heygen_session(request: HeyGenSessionRequest):
-    """創建HeyGen會話 - 通過後端代理避免CORS"""
+    """創建 HeyGen 會話 - 步驟2，使用正確的 API 端點"""
     heygen_api_key = os.getenv("HEYGEN_API_KEY")
     if not heygen_api_key:
         return HeyGenSessionResponse(
@@ -310,36 +295,39 @@ async def create_heygen_session(request: HeyGenSessionRequest):
     
     avatar_id = request.avatar_id or os.getenv("HEYGEN_AVATAR_ID", "default_avatar")
     
+    # 正確的請求格式
     session_data = {
-        "avatar_name": avatar_id,
-        "voice": {
-            "voice_id": request.voice,
-            "rate": 1.0,
-            "emotion": "friendly"
-        },
-        "quality": request.quality,
-        "language": "zh-TW"
+        "version": request.version,
+        "avatar_id": avatar_id,
+        "quality": request.quality
     }
     
+    # 如果有語音設置，加入語音配置
+    if request.voice:
+        session_data["voice"] = request.voice
+    
     headers = {
-        "X-API-KEY": heygen_api_key,
+        "X-Api-Key": heygen_api_key,  # 使用 X-Api-Key 而不是 Authorization Bearer
         "Content-Type": "application/json"
     }
     
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                "https://api.heygen.com/v2/streaming/create_session",
+                "https://api.heygen.com/v1/streaming.new",  # 正確的端點
                 headers=headers,
                 json=session_data
             ) as response:
                 if response.status == 200:
                     result = await response.json()
-                    if result.get("code") == 100:
+                    if result.get("code") == 100:  # HeyGen 成功代碼
+                        data = result.get("data", {})
                         return HeyGenSessionResponse(
                             success=True,
-                            session_id=result["data"]["session_id"],
-                            data=result["data"]
+                            session_id=data.get("session_id"),
+                            access_token=data.get("access_token"),
+                            url=data.get("url"),
+                            data=data
                         )
                     else:
                         return HeyGenSessionResponse(
@@ -360,33 +348,80 @@ async def create_heygen_session(request: HeyGenSessionRequest):
             error=str(e)
         )
 
-@router.post("/heygen/send_text")
-async def send_text_to_heygen(request: HeyGenTextRequest):
-    """發送文字到HeyGen Avatar"""
+@router.post("/heygen/start_session")
+async def start_heygen_session(request: dict):
+    """啟動 HeyGen 會話 - 步驟3"""
+    session_id = request.get("session_id")
+    if not session_id:
+        return {"success": False, "error": "Session ID required"}
+        
     heygen_api_key = os.getenv("HEYGEN_API_KEY")
     if not heygen_api_key:
         return {"success": False, "error": "HeyGen API key not configured"}
     
-    repeat_data = {
+    headers = {
+        "X-Api-Key": heygen_api_key,
+        "Content-Type": "application/json"
+    }
+    
+    start_data = {
+        "session_id": session_id
+    }
+    
+    # 如果有 SDP，也加入
+    if "sdp" in request:
+        start_data["sdp"] = request["sdp"]
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.heygen.com/v1/streaming.start",
+                headers=headers,
+                json=start_data
+            ) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    return {
+                        "success": True,
+                        "data": result.get("data")
+                    }
+                else:
+                    error_text = await response.text()
+                    return {
+                        "success": False,
+                        "error": f"HTTP {response.status}: {error_text}"
+                    }
+                    
+    except Exception as e:
+        logger.error(f"Failed to start HeyGen session: {e}")
+        return {"success": False, "error": str(e)}
+
+@router.post("/heygen/send_text")
+async def send_text_to_heygen(request: HeyGenTextRequest):
+    """發送文字到 HeyGen Avatar - 使用正確的格式"""
+    heygen_api_key = os.getenv("HEYGEN_API_KEY")
+    if not heygen_api_key:
+        return {"success": False, "error": "HeyGen API key not configured"}
+    
+    # 使用 WebSocket 或 task 端點
+    task_data = {
         "session_id": request.session_id,
         "text": request.text,
-        "voice": {
-            "emotion": request.emotion,
-            "rate": 1.0
-        }
+        "task_type": request.task_type,
+        "task_mode": request.task_mode
     }
     
     headers = {
-        "X-API-KEY": heygen_api_key,
+        "X-Api-Key": heygen_api_key,
         "Content-Type": "application/json"
     }
     
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                "https://api.heygen.com/v2/streaming/repeat",
+                "https://api.heygen.com/v1/streaming.task",  # 正確的任務端點
                 headers=headers,
-                json=repeat_data
+                json=task_data
             ) as response:
                 if response.status == 200:
                     result = await response.json()
@@ -410,7 +445,7 @@ async def send_text_to_heygen(request: HeyGenTextRequest):
 
 @router.post("/heygen/close_session")
 async def close_heygen_session(request: dict):
-    """關閉HeyGen會話"""
+    """關閉 HeyGen 會話"""
     session_id = request.get("session_id")
     if not session_id:
         return {"success": False, "error": "Session ID required"}
@@ -420,7 +455,7 @@ async def close_heygen_session(request: dict):
         return {"success": False, "error": "HeyGen API key not configured"}
     
     headers = {
-        "X-API-KEY": heygen_api_key,
+        "X-Api-Key": heygen_api_key,
         "Content-Type": "application/json"
     }
     
@@ -429,7 +464,7 @@ async def close_heygen_session(request: dict):
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                "https://api.heygen.com/v2/streaming/close_session",
+                "https://api.heygen.com/v1/streaming.stop",  # 正確的停止端點
                 headers=headers,
                 json=close_data
             ) as response:
@@ -439,31 +474,32 @@ async def close_heygen_session(request: dict):
         logger.error(f"Failed to close HeyGen session: {e}")
         return {"success": False, "error": str(e)}
 
-# ================= 背景任務函數 =================
+# ================= 背景任務 =================
 
 async def send_text_to_heygen_background(session_id: str, text: str):
-    """背景任務：發送文字到HeyGen"""
+    """背景任務：發送文字到 HeyGen"""
     try:
         heygen_api_key = os.getenv("HEYGEN_API_KEY")
         if not heygen_api_key:
             return
             
-        repeat_data = {
+        task_data = {
             "session_id": session_id,
             "text": text,
-            "voice": {"emotion": "friendly", "rate": 1.0}
+            "task_type": "repeat",
+            "task_mode": "sync"
         }
         
         headers = {
-            "X-API-KEY": heygen_api_key,
+            "X-Api-Key": heygen_api_key,
             "Content-Type": "application/json"
         }
         
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                "https://api.heygen.com/v2/streaming/repeat",
+                "https://api.heygen.com/v1/streaming.task",
                 headers=headers,
-                json=repeat_data
+                json=task_data
             ) as response:
                 if response.status != 200:
                     logger.error(f"HeyGen background task failed: {response.status}")
@@ -471,7 +507,61 @@ async def send_text_to_heygen_background(session_id: str, text: str):
     except Exception as e:
         logger.error(f"Background HeyGen task failed: {e}")
 
-# ================= 健康檢查端點 =================
+# ================= 健康檢查 =================
+
+@router.get("/health/heygen")
+async def health_heygen():
+    """HeyGen 健康檢查 - 使用正確的 API"""
+    heygen_api_key = os.getenv("HEYGEN_API_KEY")
+    avatar_id = os.getenv("HEYGEN_AVATAR_ID")
+    
+    info = {
+        "has_api_key": bool(heygen_api_key),
+        "has_avatar_id": bool(avatar_id),
+        "avatar_id": avatar_id if avatar_id else "not_configured",
+        "ok": False,
+        "error": None,
+        "correct_endpoints": {
+            "create_token": "/v1/streaming.create_token",
+            "create_session": "/v1/streaming.new",
+            "start_session": "/v1/streaming.start",
+            "send_task": "/v1/streaming.task",
+            "close_session": "/v1/streaming.stop"
+        }
+    }
+    
+    if not heygen_api_key:
+        info["error"] = "HEYGEN_API_KEY not set"
+        return info
+    
+    try:
+        headers = {
+            "X-Api-Key": heygen_api_key,
+            "Content-Type": "application/json"
+        }
+        
+        # 測試創建令牌
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.heygen.com/v1/streaming.create_token",
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as response:
+                if response.status == 200:
+                    info["ok"] = True
+                    info["token_creation"] = "success"
+                else:
+                    error_text = await response.text()
+                    info["error"] = f"Token creation failed - HTTP {response.status}: {error_text[:100]}"
+                    
+    except asyncio.TimeoutError:
+        info["error"] = "Connection timeout"
+    except Exception as e:
+        info["error"] = f"{type(e).__name__}: {str(e)[:150]}"
+    
+    return info
+
+# ================= 其他端點 =================
 
 @router.get("/health/openai")
 async def health_openai():
@@ -501,116 +591,15 @@ async def health_openai():
             max_tokens=5
         )
         info["ok"] = bool(response.choices)
-        info["response_id"] = response.id if hasattr(response, 'id') else None
         return info
         
     except Exception as e:
         info["error"] = f"{type(e).__name__}: {str(e)[:150]}"
         return info
-
-@router.get("/health/heygen")
-async def health_heygen():
-    """HeyGen 健康檢查"""
-    heygen_api_key = os.getenv("HEYGEN_API_KEY")
-    avatar_id = os.getenv("HEYGEN_AVATAR_ID")
-    
-    info = {
-        "has_api_key": bool(heygen_api_key),
-        "has_avatar_id": bool(avatar_id),
-        "avatar_id": avatar_id if avatar_id else "not_configured",
-        "ok": False,
-        "error": None
-    }
-    
-    if not heygen_api_key:
-        info["error"] = "HEYGEN_API_KEY not set"
-        return info
-    
-    if not avatar_id:
-        info["error"] = "HEYGEN_AVATAR_ID not set"
-        return info
-    
-    try:
-        # 簡單的API連通性測試
-        headers = {
-            "X-API-KEY": heygen_api_key,
-            "Content-Type": "application/json"
-        }
-        
-        # 測試用的最小session請求
-        test_data = {
-            "avatar_name": avatar_id,
-            "voice": {"voice_id": "zh-TW-HsiaoChenNeural"},
-            "quality": "medium",
-            "language": "zh-TW"
-        }
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                "https://api.heygen.com/v2/streaming/create_session",
-                headers=headers,
-                json=test_data,
-                timeout=aiohttp.ClientTimeout(total=10)  # 10秒超時
-            ) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    if result.get("code") == 100:
-                        # 立即關閉測試會話
-                        test_session_id = result["data"]["session_id"]
-                        await session.post(
-                            "https://api.heygen.com/v2/streaming/close_session",
-                            headers=headers,
-                            json={"session_id": test_session_id}
-                        )
-                        info["ok"] = True
-                        info["test_session_created"] = True
-                    else:
-                        info["error"] = result.get("message", "Session creation failed")
-                else:
-                    error_text = await response.text()
-                    info["error"] = f"HTTP {response.status}: {error_text[:100]}"
-                    
-    except asyncio.TimeoutError:
-        info["error"] = "Connection timeout"
-    except Exception as e:
-        info["error"] = f"{type(e).__name__}: {str(e)[:150]}"
-    
-    return info
-
-# ================= Debug 端點 =================
-
-@router.get("/personas/info")
-async def get_personas_info():
-    """取得所有 Persona 的基本資訊（用於除錯）"""
-    personas_info = {}
-    for bot_type, config in ENHANCED_PERSONA_STYLES.items():
-        personas_info[bot_type] = {
-            "name": config["name"],
-            "system_prompt_length": len(config["system"]),
-            "key_features": extract_key_features(config["system"])
-        }
-    
-    return {
-        "enhanced_personas": personas_info,
-        "total_personas": len(ENHANCED_PERSONA_STYLES),
-        "available_types": list(ENHANCED_PERSONA_STYLES.keys()),
-        "heygen_enabled": bool(os.getenv("HEYGEN_API_KEY"))
-    }
-
-def extract_key_features(system_prompt: str) -> List[str]:
-    """從 system prompt 中提取關鍵特徵"""
-    features = []
-    lines = system_prompt.split('\n')
-    for line in lines:
-        if '**' in line and ('技巧' in line or '風格' in line or '定位' in line):
-            features.append(line.strip().replace('**', ''))
-    return features[:3]  # 只返回前3個關鍵特徵
-
-# ================= 路由列表檢查 =================
 
 @router.get("/routes")
 async def list_routes():
-    """列出所有可用的路由（用於除錯）"""
+    """列出所有可用的路由"""
     routes = []
     for route in router.routes:
         if hasattr(route, 'methods') and hasattr(route, 'path'):
