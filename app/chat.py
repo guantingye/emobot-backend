@@ -35,29 +35,32 @@ class SendResult(BaseModel):
     message_id: Optional[int] = None
     session_id: Optional[str] = None
 
-# HeyGen 正確的模型
-class HeyGenTokenRequest(BaseModel):
-    pass  # 創建令牌不需要參數
+# HeyGen 正確的模型 - 修復 voice 參數格式
+class HeyGenVoiceConfig(BaseModel):
+    voice_id: str = Field(default="zh-TW-HsiaoChenNeural")
+    rate: float = Field(default=1.0)
+    emotion: str = Field(default="friendly")
 
 class HeyGenSessionRequest(BaseModel):
     avatar_id: Optional[str] = Field(default=None)
-    voice: Optional[Dict[str, Any]] = Field(default=None)
+    voice: Optional[HeyGenVoiceConfig] = Field(default=None)  # 修改為物件類型
     quality: str = Field(default="medium")
-    version: str = Field(default="v2")
+    language: str = Field(default="zh-TW")
 
 class HeyGenSessionResponse(BaseModel):
     success: bool
     session_id: Optional[str] = None
     access_token: Optional[str] = None
     url: Optional[str] = None
+    stream_url: Optional[str] = None  # 新增串流URL
     error: Optional[str] = None
     data: Optional[Dict] = None
 
 class HeyGenTextRequest(BaseModel):
     session_id: str
     text: str
-    task_type: str = Field(default="repeat")
-    task_mode: str = Field(default="sync")
+    emotion: str = Field(default="friendly")
+    rate: float = Field(default=1.0)
 
 # ================= Persona System (保持原有) =================
 
@@ -76,7 +79,7 @@ ENHANCED_PERSONA_STYLES = {
     },
     "cognitive": {
         "name": "Clara",
-        "system": """你是 Clara，一位理性的認知型 AI 夥伴。協助辨識自動想法與認知偏誤，提供結構化的思維練習。用繁體中文回覆。""",
+        "system": """你是 Clara，一位理性的認知型 AI 夥伴。幫助辨識自動想法與認知偏誤，提供結構化的思維練習。用繁體中文回覆。""",
     }
 }
 
@@ -245,47 +248,11 @@ async def send_chat(
             error=f"API temporarily unavailable: {str(e)[:100]}"
         )
 
-# ================= 正確的 HeyGen API 實作 =================
-
-@router.post("/heygen/create_token")
-async def create_heygen_token():
-    """創建 HeyGen 訪問令牌 - 步驟1"""
-    heygen_api_key = os.getenv("HEYGEN_API_KEY")
-    if not heygen_api_key:
-        return {"success": False, "error": "HeyGen API key not configured"}
-    
-    headers = {
-        "X-Api-Key": heygen_api_key,
-        "Content-Type": "application/json"
-    }
-    
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                "https://api.heygen.com/v1/streaming.create_token",
-                headers=headers
-            ) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    return {
-                        "success": True,
-                        "token": result.get("data", {}).get("token"),
-                        "data": result.get("data")
-                    }
-                else:
-                    error_text = await response.text()
-                    return {
-                        "success": False,
-                        "error": f"HTTP {response.status}: {error_text}"
-                    }
-                    
-    except Exception as e:
-        logger.error(f"Failed to create HeyGen token: {e}")
-        return {"success": False, "error": str(e)}
+# ================= 修正的 HeyGen API 實作 (v2) =================
 
 @router.post("/heygen/create_session", response_model=HeyGenSessionResponse)
 async def create_heygen_session(request: HeyGenSessionRequest):
-    """創建 HeyGen 會話 - 步驟2，使用正確的 API 端點"""
+    """創建 HeyGen 會話 - 使用正確的 v2 API 格式"""
     heygen_api_key = os.getenv("HEYGEN_API_KEY")
     if not heygen_api_key:
         return HeyGenSessionResponse(
@@ -293,30 +260,32 @@ async def create_heygen_session(request: HeyGenSessionRequest):
             error="HeyGen API key not configured"
         )
     
-    avatar_id = request.avatar_id or os.getenv("HEYGEN_AVATAR_ID", "default_avatar")
+    avatar_id = request.avatar_id or os.getenv("HEYGEN_AVATAR_ID", "June_HR_public")
     
-    # 正確的請求格式
+    # 修正：正確的 v2 API 請求格式
     session_data = {
-        "version": request.version,
-        "avatar_id": avatar_id,
-        "quality": request.quality
+        "avatar_name": avatar_id,  # v2 使用 avatar_name 而非 avatar_id
+        "voice": {
+            "voice_id": request.voice.voice_id if request.voice else "zh-TW-HsiaoChenNeural",
+            "rate": request.voice.rate if request.voice else 1.0,
+            "emotion": request.voice.emotion if request.voice else "friendly"
+        },
+        "quality": request.quality,
+        "language": request.language
     }
     
-    # 如果有語音設置，加入語音配置
-    if request.voice:
-        session_data["voice"] = request.voice
-    
     headers = {
-        "X-Api-Key": heygen_api_key,  # 使用 X-Api-Key 而不是 Authorization Bearer
+        "X-API-KEY": heygen_api_key,  # v2 使用 X-API-KEY
         "Content-Type": "application/json"
     }
     
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                "https://api.heygen.com/v1/streaming.new",  # 正確的端點
+                "https://api.heygen.com/v2/streaming/create_session",  # v2 端點
                 headers=headers,
-                json=session_data
+                json=session_data,
+                timeout=aiohttp.ClientTimeout(total=30)  # 增加超時時間
             ) as response:
                 if response.status == 200:
                     result = await response.json()
@@ -325,8 +294,7 @@ async def create_heygen_session(request: HeyGenSessionRequest):
                         return HeyGenSessionResponse(
                             success=True,
                             session_id=data.get("session_id"),
-                            access_token=data.get("access_token"),
-                            url=data.get("url"),
+                            stream_url=data.get("url"),  # v2 返回的是 url 欄位
                             data=data
                         )
                     else:
@@ -336,11 +304,17 @@ async def create_heygen_session(request: HeyGenSessionRequest):
                         )
                 else:
                     error_text = await response.text()
+                    logger.error(f"HeyGen API error {response.status}: {error_text}")
                     return HeyGenSessionResponse(
                         success=False,
-                        error=f"HTTP {response.status}: {error_text}"
+                        error=f"HTTP {response.status}: {error_text[:200]}"
                     )
                     
+    except asyncio.TimeoutError:
+        return HeyGenSessionResponse(
+            success=False,
+            error="Request timeout - HeyGen service may be slow"
+        )
     except Exception as e:
         logger.error(f"HeyGen session creation failed: {e}")
         return HeyGenSessionResponse(
@@ -348,80 +322,35 @@ async def create_heygen_session(request: HeyGenSessionRequest):
             error=str(e)
         )
 
-@router.post("/heygen/start_session")
-async def start_heygen_session(request: dict):
-    """啟動 HeyGen 會話 - 步驟3"""
-    session_id = request.get("session_id")
-    if not session_id:
-        return {"success": False, "error": "Session ID required"}
-        
-    heygen_api_key = os.getenv("HEYGEN_API_KEY")
-    if not heygen_api_key:
-        return {"success": False, "error": "HeyGen API key not configured"}
-    
-    headers = {
-        "X-Api-Key": heygen_api_key,
-        "Content-Type": "application/json"
-    }
-    
-    start_data = {
-        "session_id": session_id
-    }
-    
-    # 如果有 SDP，也加入
-    if "sdp" in request:
-        start_data["sdp"] = request["sdp"]
-    
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                "https://api.heygen.com/v1/streaming.start",
-                headers=headers,
-                json=start_data
-            ) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    return {
-                        "success": True,
-                        "data": result.get("data")
-                    }
-                else:
-                    error_text = await response.text()
-                    return {
-                        "success": False,
-                        "error": f"HTTP {response.status}: {error_text}"
-                    }
-                    
-    except Exception as e:
-        logger.error(f"Failed to start HeyGen session: {e}")
-        return {"success": False, "error": str(e)}
-
 @router.post("/heygen/send_text")
 async def send_text_to_heygen(request: HeyGenTextRequest):
-    """發送文字到 HeyGen Avatar - 使用正確的格式"""
+    """發送文字到 HeyGen Avatar - 使用正確的 v2 格式"""
     heygen_api_key = os.getenv("HEYGEN_API_KEY")
     if not heygen_api_key:
         return {"success": False, "error": "HeyGen API key not configured"}
     
-    # 使用 WebSocket 或 task 端點
-    task_data = {
+    # v2 repeat 端點格式
+    repeat_data = {
         "session_id": request.session_id,
         "text": request.text,
-        "task_type": request.task_type,
-        "task_mode": request.task_mode
+        "voice": {
+            "emotion": request.emotion,
+            "rate": request.rate
+        }
     }
     
     headers = {
-        "X-Api-Key": heygen_api_key,
+        "X-API-KEY": heygen_api_key,
         "Content-Type": "application/json"
     }
     
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                "https://api.heygen.com/v1/streaming.task",  # 正確的任務端點
+                "https://api.heygen.com/v2/streaming/repeat",  # v2 端點
                 headers=headers,
-                json=task_data
+                json=repeat_data,
+                timeout=aiohttp.ClientTimeout(total=15)
             ) as response:
                 if response.status == 200:
                     result = await response.json()
@@ -434,9 +363,10 @@ async def send_text_to_heygen(request: HeyGenTextRequest):
                         }
                 else:
                     error_text = await response.text()
+                    logger.error(f"HeyGen repeat error {response.status}: {error_text}")
                     return {
                         "success": False,
-                        "error": f"HTTP {response.status}: {error_text}"
+                        "error": f"HTTP {response.status}: {error_text[:200]}"
                     }
                     
     except Exception as e:
@@ -455,7 +385,7 @@ async def close_heygen_session(request: dict):
         return {"success": False, "error": "HeyGen API key not configured"}
     
     headers = {
-        "X-Api-Key": heygen_api_key,
+        "X-API-KEY": heygen_api_key,
         "Content-Type": "application/json"
     }
     
@@ -464,7 +394,7 @@ async def close_heygen_session(request: dict):
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                "https://api.heygen.com/v1/streaming.stop",  # 正確的停止端點
+                "https://api.heygen.com/v2/streaming/close_session",  # v2 端點
                 headers=headers,
                 json=close_data
             ) as response:
@@ -483,23 +413,25 @@ async def send_text_to_heygen_background(session_id: str, text: str):
         if not heygen_api_key:
             return
             
-        task_data = {
+        repeat_data = {
             "session_id": session_id,
             "text": text,
-            "task_type": "repeat",
-            "task_mode": "sync"
+            "voice": {
+                "emotion": "friendly",
+                "rate": 1.0
+            }
         }
         
         headers = {
-            "X-Api-Key": heygen_api_key,
+            "X-API-KEY": heygen_api_key,
             "Content-Type": "application/json"
         }
         
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                "https://api.heygen.com/v1/streaming.task",
+                "https://api.heygen.com/v2/streaming/repeat",
                 headers=headers,
-                json=task_data
+                json=repeat_data
             ) as response:
                 if response.status != 200:
                     logger.error(f"HeyGen background task failed: {response.status}")
@@ -511,7 +443,7 @@ async def send_text_to_heygen_background(session_id: str, text: str):
 
 @router.get("/health/heygen")
 async def health_heygen():
-    """HeyGen 健康檢查 - 使用正確的 API"""
+    """HeyGen 健康檢查 - 使用正確的 v2 API"""
     heygen_api_key = os.getenv("HEYGEN_API_KEY")
     avatar_id = os.getenv("HEYGEN_AVATAR_ID")
     
@@ -519,14 +451,13 @@ async def health_heygen():
         "has_api_key": bool(heygen_api_key),
         "has_avatar_id": bool(avatar_id),
         "avatar_id": avatar_id if avatar_id else "not_configured",
+        "api_version": "v2",
         "ok": False,
         "error": None,
-        "correct_endpoints": {
-            "create_token": "/v1/streaming.create_token",
-            "create_session": "/v1/streaming.new",
-            "start_session": "/v1/streaming.start",
-            "send_task": "/v1/streaming.task",
-            "close_session": "/v1/streaming.stop"
+        "endpoints": {
+            "create_session": "/v2/streaming/create_session",
+            "send_text": "/v2/streaming/repeat",
+            "close_session": "/v2/streaming/close_session"
         }
     }
     
@@ -536,23 +467,42 @@ async def health_heygen():
     
     try:
         headers = {
-            "X-Api-Key": heygen_api_key,
+            "X-API-KEY": heygen_api_key,
             "Content-Type": "application/json"
         }
         
-        # 測試創建令牌
+        # 測試用的最小 session 請求
+        test_data = {
+            "avatar_name": avatar_id or "June_HR_public",
+            "voice": {"voice_id": "zh-TW-HsiaoChenNeural"},
+            "quality": "medium",
+            "language": "zh-TW"
+        }
+        
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                "https://api.heygen.com/v1/streaming.create_token",
+                "https://api.heygen.com/v2/streaming/create_session",
                 headers=headers,
-                timeout=aiohttp.ClientTimeout(total=10)
+                json=test_data,
+                timeout=aiohttp.ClientTimeout(total=15)
             ) as response:
                 if response.status == 200:
-                    info["ok"] = True
-                    info["token_creation"] = "success"
+                    result = await response.json()
+                    if result.get("code") == 100:
+                        # 立即關閉測試會話
+                        test_session_id = result["data"]["session_id"]
+                        await session.post(
+                            "https://api.heygen.com/v2/streaming/close_session",
+                            headers=headers,
+                            json={"session_id": test_session_id}
+                        )
+                        info["ok"] = True
+                        info["test_session_created"] = True
+                    else:
+                        info["error"] = result.get("message", "Session creation failed")
                 else:
                     error_text = await response.text()
-                    info["error"] = f"Token creation failed - HTTP {response.status}: {error_text[:100]}"
+                    info["error"] = f"HTTP {response.status}: {error_text[:100]}"
                     
     except asyncio.TimeoutError:
         info["error"] = "Connection timeout"
@@ -611,5 +561,6 @@ async def list_routes():
     return {
         "total_routes": len(routes),
         "routes": routes,
-        "heygen_routes": [r for r in routes if 'heygen' in r['path']]
+        "heygen_routes": [r for r in routes if 'heygen' in r['path']],
+        "api_version": "v2"
     }
