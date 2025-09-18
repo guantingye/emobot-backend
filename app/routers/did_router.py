@@ -1,127 +1,120 @@
 # app/routers/did_router.py
-from __future__ import annotations
-import os
-import base64
-from typing import Optional, Dict, Any
-
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
-import httpx
-
-DID_API_BASE = os.getenv("DID_API_BASE", "https://api.d-id.com")
-DID_API_KEY = os.getenv("DID_API_KEY", "")
-DID_SOURCE_URL_DEFAULT = os.getenv("DID_SOURCE_URL", "")  # 你的頭像圖片 URL
-DID_VOICE_DEFAULT = os.getenv("DID_VOICE_ID", "zh-TW-HsiaoChenNeural")
-
-if not DID_API_KEY:
-    # 先不要在 import 階段就 raise，讓 /health 可以告知缺環境變數
-    pass
+import httpx, os, logging
 
 router = APIRouter(prefix="/api/chat/did", tags=["did"])
+log = logging.getLogger("did")
 
-def _auth_header() -> Dict[str, str]:
-    """
-    D-ID 為 Basic Auth，內容是 base64("API_KEY:")，冒號不可省略。
-    """
-    if not DID_API_KEY:
-        raise HTTPException(status_code=500, detail="DID_API_KEY is not configured")
-    token = base64.b64encode(f"{DID_API_KEY}:".encode("utf-8")).decode("utf-8")
-    return {"Authorization": f"Basic {token}"}
+DID_API_KEY = os.getenv("DID_API_KEY", "").strip()
+DID_DEFAULT_SOURCE = os.getenv("DID_SOURCE_URL", "").strip()
+DID_BASE = "https://api.d-id.com"
 
 class CreateTalkBody(BaseModel):
-    text: str = Field(..., description="要轉成語音並生成嘴型同步影片的文字")
-    voice_id: Optional[str] = Field(default=DID_VOICE_DEFAULT)
-    source_url: Optional[str] = Field(default=None, description="頭像圖片 URL。不傳則用環境變數 DID_SOURCE_URL")
-    config: Optional[Dict[str, Any]] = Field(
-        default={"fluent": True, "pad_audio": 0.5},
-        description="D-ID config 參數"
-    )
+    text: str = Field(..., min_length=1)
+    voice_id: str = Field(default="zh-TW-HsiaoChenNeural")
+    source_url: str | None = None
+    config: dict = Field(default={"fluent": True, "pad_audio": 0.3})
 
 @router.get("/health")
 async def did_health():
-    """
-    輕量健康檢查：僅檢查環境變數是否設定齊全。
-    若你想要真的 ping D-ID，可在此加上一次 GET，但為避免配額浪費先不打外部 API。
-    """
-    ok = bool(DID_API_KEY)
-    return {"ok": ok, "has_api_key": ok, "voice_default": DID_VOICE_DEFAULT, "source_default": bool(DID_SOURCE_URL_DEFAULT)}
+    if not DID_API_KEY:
+        return {"ok": False, "reason": "DID_API_KEY missing"}
+    # 簡單 ping：取得最近一筆 talks（不一定有，但可驗權）
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(
+                f"{DID_BASE}/talks?limit=1",
+                headers={"accept": "application/json", "authorization": f"Basic {DID_API_KEY}"}
+            )
+        if r.status_code in (200, 204):
+            return {"ok": True}
+        return {"ok": False, "status": r.status_code, "detail": _safe_json(r)}
+    except Exception as e:
+        log.exception("health error")
+        return {"ok": False, "error": str(e)}
+
+def _safe_json(resp: httpx.Response):
+    try:
+        return resp.json()
+    except Exception:
+        return {"raw": resp.text}
 
 @router.post("/create_talk")
 async def create_talk(body: CreateTalkBody):
-    """
-    建立一支 talk，回傳 talk_id。前端可用 talk_id 輪詢查詢狀態並取得 result_url。
-    """
     if not DID_API_KEY:
-        raise HTTPException(status_code=500, detail="DID_API_KEY is not configured")
+        raise HTTPException(status_code=500, detail={"kind": "ConfigError", "description": "DID_API_KEY missing"})
 
     payload = {
         "script": {
             "type": "text",
             "input": body.text,
-            # 同步支援兩種鍵，避免 D-ID 版本差異（某些文件用 provider、某些用 voice）
-            "provider": {"type": "microsoft", "voice_id": body.voice_id or DID_VOICE_DEFAULT},
-            "voice": {"type": "microsoft", "voice_id": body.voice_id or DID_VOICE_DEFAULT},
+            "voice": {"type": "microsoft", "voice_id": body.voice_id},
         },
-        "source_url": body.source_url or DID_SOURCE_URL_DEFAULT,
-        "config": body.config or {"fluent": True, "pad_audio": 0.5},
+        "source_url": body.source_url or DID_DEFAULT_SOURCE,
+        "config": body.config or {"fluent": True, "pad_audio": 0.3},
     }
 
     if not payload["source_url"]:
-        raise HTTPException(status_code=400, detail="Missing source_url (DID_SOURCE_URL not set and source_url not provided)")
+        # 允許前端不傳，後端也沒設；那就讓 D-ID 用 default presenter（若你的帳戶有）
+        payload.pop("source_url")
 
     headers = {
-        **_auth_header(),
-        "Content-Type": "application/json",
-        "Accept": "application/json",
+        "accept": "application/json",
+        "content-type": "application/json",
+        "authorization": f"Basic {DID_API_KEY}",
     }
 
-    url = f"{DID_API_BASE.rstrip('/')}/talks"
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(url, headers=headers, json=payload)
-    if resp.status_code >= 400:
-        try:
-            detail = resp.json()
-        except Exception:
-            detail = {"raw": resp.text}
-        raise HTTPException(status_code=resp.status_code, detail=detail)
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(f"{DID_BASE}/talks", headers=headers, json=payload)
 
-    data = resp.json()
-    # 常見欄位：id, status, result_url(完成後才會有)
-    return {
-        "ok": True,
-        "talk_id": data.get("id"),
-        "status": data.get("status"),
-        "result_url": data.get("result_url"),
-        "raw": data,
-    }
+        if r.status_code == 402:
+            # 額度不足：包裝成 ok:false 方便前端回退
+            return {"ok": False, "error_code": "INSUFFICIENT_CREDITS", "detail": _safe_json(r)}
+        if 200 <= r.status_code < 300:
+            j = r.json()
+            return {"ok": True, "talk_id": j.get("id"), "raw": j}
+
+        # 其他錯誤：把 D-ID 的訊息透傳，避免「UnknownError」
+        detail = _safe_json(r)
+        log.error("D-ID create failed %s %s", r.status_code, detail)
+        raise HTTPException(status_code=r.status_code, detail=detail)
+
+    except httpx.ReadTimeout:
+        raise HTTPException(status_code=504, detail={"kind": "UpstreamTimeout", "description": "D-ID timeout"})
+    except Exception as e:
+        log.exception("create_talk crashed")
+        raise HTTPException(status_code=500, detail={"kind": "BackendCrash", "description": str(e)})
 
 @router.get("/get_talk/{talk_id}")
 async def get_talk(talk_id: str):
-    """
-    查詢 talk 狀態。完成時會含 result_url，可直接給 <video> 播放。
-    """
     if not DID_API_KEY:
-        raise HTTPException(status_code=500, detail="DID_API_KEY is not configured")
+        raise HTTPException(status_code=500, detail={"kind": "ConfigError", "description": "DID_API_KEY missing"})
 
     headers = {
-        **_auth_header(),
-        "Accept": "application/json",
+        "accept": "application/json",
+        "authorization": f"Basic {DID_API_KEY}",
     }
-    url = f"{DID_API_BASE.rstrip('/')}/talks/{talk_id}"
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.get(url, headers=headers)
-    if resp.status_code >= 400:
-        try:
-            detail = resp.json()
-        except Exception:
-            detail = {"raw": resp.text}
-        raise HTTPException(status_code=resp.status_code, detail=detail)
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.get(f"{DID_BASE}/talks/{talk_id}", headers=headers)
 
-    data = resp.json()
-    return {
-        "ok": True,
-        "talk_id": data.get("id"),
-        "status": data.get("status"),
-        "result_url": data.get("result_url"),
-        "raw": data,
-    }
+        if 200 <= r.status_code < 300:
+            j = r.json()
+            # D-ID 完成時會提供 result_url / result_url_expire_at
+            status = j.get("status")
+            if status in ("done", "generated", "succeeded"):
+                return {"status": "done", "result_url": j.get("result_url"), "raw": j}
+            if status in ("error", "failed"):
+                return {"status": "error", "raw": j}
+            return {"status": status or "pending", "raw": j}
+
+        detail = _safe_json(r)
+        raise HTTPException(status_code=r.status_code, detail=detail)
+
+    except httpx.ReadTimeout:
+        raise HTTPException(status_code=504, detail={"kind": "UpstreamTimeout", "description": "D-ID timeout"})
+    except Exception as e:
+        log.exception("get_talk crashed")
+        raise HTTPException(status_code=500, detail={"kind": "BackendCrash", "description": str(e)})
