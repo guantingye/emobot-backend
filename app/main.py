@@ -19,7 +19,7 @@ from app.core.config import settings
 from app.core.security import create_access_token, get_current_user
 from app.db.session import get_db, engine
 from app.db.base import Base
-
+from app.routers.did_agents_stream import router as did_agents_stream_router
 from app.models.user import User
 from app.models.assessment import Assessment
 from app.models.recommendation import Recommendation
@@ -186,7 +186,7 @@ try:
     app.include_router(chat_router, prefix="/api/chat", tags=["chat"])
     chat_router_loaded = True
     print("✅ Chat router 註冊成功")
-    
+    app.include_router(did_agents_stream_router, prefix="/api")
     # 檢查 HeyGen 相關路由
     heygen_routes = []
     for route in chat_router.routes:
