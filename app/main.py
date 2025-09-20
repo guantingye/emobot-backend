@@ -1,4 +1,4 @@
-# app/main.py - 最終修復版，確保 HeyGen 路由正確註冊
+# app/main.py - 最終修復版（移除 HeyGen、加入開源影音管線 media 路由與 /static 掛載）
 from __future__ import annotations
 
 import os
@@ -9,9 +9,10 @@ from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, Depends, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from sqlalchemy import text, and_
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 # ---- App internals ----
@@ -19,7 +20,7 @@ from app.core.config import settings
 from app.core.security import create_access_token, get_current_user
 from app.db.session import get_db, engine
 from app.db.base import Base
-from app.routers.did_agents_stream import router as did_agents_stream_router
+
 from app.models.user import User
 from app.models.assessment import Assessment
 from app.models.recommendation import Recommendation
@@ -27,7 +28,12 @@ from app.models.chat import ChatMessage
 from app.models.mood import MoodRecord
 from app.models.allowed_pid import AllowedPid
 from app.models.chat_session import ChatSession
+
+# 保留：D-ID 路由（若仍需相容既有前端端點）
 from app.routers import did_router
+# 新增：開源影音管線路由（/api/media/lipsync）
+from app.routers import media as media_router
+
 # ---- Optional: 外部推薦引擎，失敗時走 fallback ----
 try:
     from app.services.recommendation_engine import recommend_endpoint_payload as _build_reco
@@ -91,7 +97,15 @@ def build_recommendation_payload(user: Dict[str, Any] | None, assessment: Dict[s
 
 app = FastAPI(title="Emobot Backend", version="0.5.0")
 
+# 掛載靜態檔（供 /api/media/lipsync 產生的 mp4/wav 對外讀取）
+# 預設輸出到 static/media，這裡將 /static 對應到本機 static 目錄
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# 既有：D-ID 路由（保留相容性）
 app.include_router(did_router.router)
+# 新增：開源影音管線路由
+app.include_router(media_router.router)
+
 # ---- CORS（官方 + 強化補丁）----
 ALLOWED = getattr(settings, "ALLOWED_ORIGINS", os.getenv(
     "ALLOWED_ORIGINS",
@@ -123,7 +137,6 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["*"],
 )
-
 
 # 2) 自訂補丁：確保錯誤時也帶 CORS，並正確處理預檢 OPTIONS
 @app.middleware("http")
@@ -169,35 +182,24 @@ def on_startup():
     Base.metadata.create_all(bind=engine)
 
 
-# *** 修復：更強健的 chat router 註冊 ***
+# *** 修復：更強健的 chat router 註冊（保留原有備援機制） ***
 chat_router_loaded = False
 chat_router_error = None
 
 try:
     # 首先嘗試導入 chat 模組
     import app.chat as chat_module
-    
+
     # 檢查 router 是否存在
     if not hasattr(chat_module, 'router'):
         raise ImportError("chat.py 中沒有定義 router")
-    
+
     # 註冊路由
     chat_router = chat_module.router
     app.include_router(chat_router, prefix="/api/chat", tags=["chat"])
     chat_router_loaded = True
     print("✅ Chat router 註冊成功")
-    app.include_router(did_agents_stream_router, prefix="/api")
-    # 檢查 HeyGen 相關路由
-    heygen_routes = []
-    for route in chat_router.routes:
-        if hasattr(route, 'path') and 'heygen' in route.path:
-            heygen_routes.append(route.path)
-    
-    if heygen_routes:
-        print(f"✅ HeyGen 路由註冊成功: {heygen_routes}")
-    else:
-        print("⚠️ 警告：沒有找到 HeyGen 相關路由")
-        
+
 except ImportError as e:
     chat_router_error = f"導入錯誤: {e}"
     print(f"❌ Chat router 導入失敗: {e}")
@@ -208,18 +210,18 @@ except Exception as e:
 # 如果 chat router 載入失敗，創建緊急備用路由
 if not chat_router_loaded:
     from fastapi import APIRouter
-    
+
     emergency_router = APIRouter()
-    
+
     @emergency_router.get("/health")
     async def emergency_health():
         return {
-            "ok": False, 
-            "error": "Chat router 載入失敗", 
+            "ok": False,
+            "error": "Chat router 載入失敗",
             "details": chat_router_error,
             "emergency_mode": True
         }
-    
+
     @emergency_router.get("/status")
     async def emergency_status():
         return {
@@ -227,7 +229,7 @@ if not chat_router_loaded:
             "error": chat_router_error,
             "available_endpoints": ["/api/chat/health", "/api/chat/status"]
         }
-    
+
     app.include_router(emergency_router, prefix="/api/chat", tags=["emergency"])
     print("🚨 緊急備用路由已啟動")
 
@@ -317,7 +319,7 @@ def get_bot_name(bot_type: str) -> str:
     """取得機器人名稱"""
     names = {
         "empathy": "Lumi",
-        "insight": "Solin", 
+        "insight": "Solin",
         "solution": "Niko",
         "cognitive": "Clara"
     }
@@ -333,19 +335,19 @@ def call_openai(system_prompt: str, messages: List[Dict[str, str]]) -> str:
     try:
         from openai import OpenAI
         client = OpenAI(api_key=api_key)
-        
+
         # 準備訊息
         chat_messages = [{"role": "system", "content": system_prompt}] + messages
-        
+
         response = client.chat.completions.create(
             model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
             messages=chat_messages,
             temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.7")),
             max_tokens=int(os.getenv("OPENAI_MAX_TOKENS", "600")),
         )
-        
+
         return response.choices[0].message.content.strip() if response.choices else ""
-        
+
     except Exception as e:
         print(f"OpenAI API failed: {e}")
         # 返回預設回覆而不是拋出異常
@@ -368,7 +370,7 @@ def get_or_create_active_session(user_id: int, bot_type: str, db: Session) -> Ch
         ChatSession.user_id == user_id,
         ChatSession.is_active == True
     ).first()
-    
+
     if active_session:
         # 更新最後活動時間
         active_session.last_activity = datetime.utcnow()
@@ -376,7 +378,7 @@ def get_or_create_active_session(user_id: int, bot_type: str, db: Session) -> Ch
         db.add(active_session)
         db.commit()
         return active_session
-    
+
     # 建立新會話
     new_session = ChatSession(
         user_id=user_id,
@@ -394,22 +396,22 @@ def get_or_create_active_session(user_id: int, bot_type: str, db: Session) -> Ch
 def end_inactive_sessions(db: Session, timeout_minutes: int = 5):
     """結束非活躍的會話（超過指定分鐘數沒有活動）"""
     timeout_threshold = datetime.utcnow() - timedelta(minutes=timeout_minutes)
-    
+
     inactive_sessions = db.query(ChatSession).filter(
         ChatSession.is_active == True,
         ChatSession.last_activity < timeout_threshold
     ).all()
-    
+
     for session in inactive_sessions:
         session.is_active = False
         session.session_end = datetime.utcnow()
         session.end_reason = "timeout"
         db.add(session)
-    
+
     if inactive_sessions:
         db.commit()
         print(f"已結束 {len(inactive_sessions)} 個非活躍會話")
-    
+
     return len(inactive_sessions)
 
 
@@ -419,13 +421,13 @@ def update_session_activity(user_id: int, db: Session):
         ChatSession.user_id == user_id,
         ChatSession.is_active == True
     ).first()
-    
+
     if active_session:
         active_session.last_activity = datetime.utcnow()
         active_session.message_count += 1
         db.add(active_session)
         db.commit()
-    
+
     return active_session
 
 
@@ -436,11 +438,11 @@ def update_session_activity(user_id: int, db: Session):
 @app.get("/api/health")
 def health():
     return {
-        "ok": True, 
+        "ok": True,
         "time": datetime.utcnow().isoformat() + "Z",
         "chat_router_loaded": chat_router_loaded,
         "chat_router_error": chat_router_error,
-        "heygen_enabled": bool(os.getenv("HEYGEN_API_KEY")),
+        # 移除 HeyGen 報告欄位
         "routes_count": len(app.routes)
     }
 
@@ -454,7 +456,7 @@ def db_test(db: Session = Depends(get_db)):
     return {"ok": True}
 
 
-# *** 新增：路由診斷端點 ***
+# *** 新增：路由診斷端點（移除 HeyGen 檢索） ***
 @app.get("/api/debug/routes")
 def list_all_routes():
     """列出所有註冊的路由（用於診斷 404 問題）"""
@@ -470,7 +472,7 @@ def list_all_routes():
         "total_routes": len(routes),
         "routes": routes,
         "chat_routes": [r for r in routes if '/chat/' in r['path']],
-        "heygen_routes": [r for r in routes if 'heygen' in r['path']],
+        "media_routes": [r for r in routes if '/api/media/' in r['path']],
         "chat_router_status": {
             "loaded": chat_router_loaded,
             "error": chat_router_error
@@ -490,7 +492,7 @@ def _auth_join(body: JoinRequest, db: Session):
     # 檢查 PID 是否在允許清單中
     if not is_pid_allowed(pid, db):
         raise HTTPException(
-            status_code=403, 
+            status_code=403,
             detail="此 PID 未被授權使用系統，請聯繫管理員"
         )
 
@@ -752,7 +754,7 @@ def chat_send(
     try:
         # 先清理非活躍會話
         end_inactive_sessions(db)
-        
+
         # 取得或建立聊天會話
         chat_session = get_or_create_active_session(user_id, bot_type, db)
 
@@ -767,25 +769,25 @@ def chat_send(
         )
         db.add(user_message)
         db.commit()
-        
+
         # 更新會話活動
         update_session_activity(user_id, db)
-        
+
         # 2. 準備 OpenAI 請求
         system_prompt = get_system_prompt(bot_type)
-        
+
         # 轉換歷史記錄格式
         messages = []
         for h in (body.history or [])[-10:]:  # 只取最近 10 條
             role = "assistant" if h.get("role") == "assistant" else "user"
             messages.append({"role": role, "content": h.get("content", "")})
-        
+
         # 添加當前使用者訊息
         messages.append({"role": "user", "content": user_msg})
-        
+
         # 3. 呼叫 OpenAI
         reply_text = call_openai(system_prompt, messages)
-        
+
         # 4. 儲存 AI 回覆
         ai_message = ChatMessage(
             user_id=user_id,
@@ -794,30 +796,30 @@ def chat_send(
             role="ai",
             content=reply_text,
             meta={
-                "provider": "openai", 
+                "provider": "openai",
                 "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
                 "session_id": chat_session.id
             }
         )
         db.add(ai_message)
         db.commit()
-        
+
         # 再次更新會話活動（AI 回覆也算活動）
         update_session_activity(user_id, db)
-        
+
         # 5. 返回結果（修復：確保包含 ok 欄位）
         return {
-            "ok": True,  
+            "ok": True,
             "reply": reply_text,
             "bot": {
-                "type": bot_type, 
+                "type": bot_type,
                 "name": get_bot_name(bot_type)
             },
             "message_id": ai_message.id,
             "session_id": chat_session.id,
             "error": None
         }
-        
+
     except Exception as e:
         print(f"Chat send error: {e}")
         db.rollback()
@@ -919,9 +921,9 @@ def my_chat_messages(
     query = db.query(ChatMessage).filter(ChatMessage.user_id == user.id)
     if bot_type:
         query = query.filter(ChatMessage.bot_type == bot_type)
-    
+
     messages = query.order_by(ChatMessage.created_at.desc()).limit(limit).all()
-    
+
     return {
         "messages": [
             {
@@ -954,13 +956,13 @@ def create_chat_session(
         ChatSession.user_id == user.id,
         ChatSession.is_active == True
     ).all()
-    
+
     for session in existing_sessions:
         session.is_active = False
         session.session_end = datetime.utcnow()
         session.end_reason = "user_ended"
         db.add(session)
-    
+
     # 創建新會話
     new_session = ChatSession(
         user_id=user.id,
@@ -972,7 +974,7 @@ def create_chat_session(
     db.add(new_session)
     db.commit()
     db.refresh(new_session)
-    
+
     return {"ok": True, "session_id": new_session.id}
 
 
@@ -988,16 +990,16 @@ def end_chat_session(
         ChatSession.user_id == user.id,
         ChatSession.is_active == True
     ).first()
-    
+
     if not session:
         raise HTTPException(status_code=404, detail="Active session not found")
-    
+
     session.is_active = False
     session.session_end = datetime.utcnow()
     session.end_reason = body.reason
     db.add(session)
     db.commit()
-    
+
     return {"ok": True, "session_ended": True}
 
 
@@ -1014,7 +1016,7 @@ def my_chat_sessions(
         .limit(limit)
         .all()
     )
-    
+
     return {
         "sessions": [
             {
@@ -1045,7 +1047,7 @@ def create_allowed_pid(
     existing = db.query(AllowedPid).filter(AllowedPid.pid == body.pid).first()
     if existing:
         raise HTTPException(status_code=400, detail="PID already exists")
-    
+
     allowed_pid = AllowedPid(
         pid=body.pid,
         description=body.description,
@@ -1087,12 +1089,12 @@ def update_allowed_pid(
     allowed_pid = db.query(AllowedPid).filter(AllowedPid.id == pid_id).first()
     if not allowed_pid:
         raise HTTPException(status_code=404, detail="Allowed PID not found")
-    
+
     if body.is_active is not None:
         allowed_pid.is_active = body.is_active
     if body.description is not None:
         allowed_pid.description = body.description
-    
+
     db.add(allowed_pid)
     db.commit()
     return {"ok": True}
@@ -1110,12 +1112,12 @@ def system_status(db: Session = Depends(get_db)):
         total_assessments = db.query(Assessment).count()
         total_chat_messages = db.query(ChatMessage).count()
         active_sessions = db.query(ChatSession).filter(ChatSession.is_active == True).count()
-        
+
         # 最近 24 小時的活動
         yesterday = datetime.utcnow() - timedelta(days=1)
         recent_messages = db.query(ChatMessage).filter(ChatMessage.created_at >= yesterday).count()
         recent_assessments = db.query(Assessment).filter(Assessment.created_at >= yesterday).count()
-        
+
         return {
             "ok": True,
             "timestamp": datetime.utcnow().isoformat() + "Z",
@@ -1132,8 +1134,8 @@ def system_status(db: Session = Depends(get_db)):
             "services": {
                 "database": True,
                 "openai": bool(os.getenv("OPENAI_API_KEY")),
-                "heygen": bool(os.getenv("HEYGEN_API_KEY")),
                 "chat_router": chat_router_loaded,
+                "media_router": True,   # 新增：影音管線路由可用
             }
         }
     except Exception as e:
