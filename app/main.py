@@ -1,12 +1,11 @@
-# app/main.py - 最終修復版，確保 CORS、HeyGen 與 AV 路由正確註冊
+# app/main.py - CORS 最終穩定版（萬用 * + 不帶憑證），確保 /api/av/utter 能回 CORS
 from __future__ import annotations
 
 import os
-import re
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
-from fastapi import FastAPI, Depends, HTTPException, Query, Request, Response
+from fastapi import FastAPI, Depends, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -28,8 +27,8 @@ from app.models.allowed_pid import AllowedPid
 from app.models.chat_session import ChatSession
 
 # 路由
-from app.routers import av                   # ← 新增 lipsync 視音訊路由
-from app.routers import did_router           # ← HeyGen / DID 既有路由（保留）
+from app.routers import av                   # lipsync 視音訊路由
+from app.routers import did_router           # HeyGen / DID 既有路由（保留）
 
 # ---- Optional: 外部推薦引擎，失敗時走 fallback ----
 try:
@@ -39,7 +38,6 @@ except Exception:
 
 
 def _fallback_build_reco(user: Dict[str, Any] | None, assessment: Dict[str, Any] | None) -> Dict[str, Any]:
-    """簡易可重現的回退推薦（保留你原本邏輯）"""
     empathy = insight = solution = cognitive = 0.25
     if assessment:
         enc = assessment.get("mbti_encoded")
@@ -89,91 +87,34 @@ def build_recommendation_payload(user: Dict[str, Any] | None, assessment: Dict[s
 # -----------------------------------------------------------------------------
 # FastAPI App
 # -----------------------------------------------------------------------------
-app = FastAPI(title="Emobot Backend", version="0.5.1")
+app = FastAPI(title="Emobot Backend", version="0.5.2")
 
-# ---- CORS（官方 + 強化補丁）----
-ALLOWED = getattr(settings, "ALLOWED_ORIGINS", os.getenv(
-    "ALLOWED_ORIGINS",
-    "https://emobot-plus.vercel.app,http://localhost:5173,http://localhost:3000"
-))
-
-def _parse_allowed(origins_str: str) -> List[str]:
-    out: List[str] = []
-    for s in (origins_str or "").split(","):
-        s = s.strip()
-        if not s or s in ("*", "null"):
-            continue
-        out.append(s.rstrip("/"))
-    return out
-
-_ALLOWED_ORIGINS = _parse_allowed(ALLOWED)
-
-# 允許 Vercel 預覽網域（更廣但安全）
-_VERCEL_REGEX_STR = r"^https:\/\/[a-z0-9\-]+\.vercel\.app$"
-_VERCEL_REGEX = re.compile(_VERCEL_REGEX_STR, re.IGNORECASE)
-
-# 1) 官方 CORSMiddleware：需在註冊任何 router 前掛上
+# ============================================================================
+# CORS（官方中介層）— 放在任何 router/mount 之前
+#   - 使用萬用 * 以避免任何「沒命中白名單」導致不回 CORS 的情況
+#   - 不帶憑證（allow_credentials=False），與前端 fetch 的 credentials:'omit' 完全相容
+# ============================================================================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_ALLOWED_ORIGINS,
-    allow_origin_regex=_VERCEL_REGEX_STR,
-    allow_credentials=True,  # 前端若使用 Bearer Token 並未帶 Cookie 也相容
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
     max_age=86400,
 )
 
-# 2) 自訂補丁：預檢與錯誤時也帶 CORS
-@app.middleware("http")
-async def _force_cors_headers(request: Request, call_next):
-    origin = request.headers.get("origin")
-    is_allowed = bool(origin and (origin.rstrip("/") in _ALLOWED_ORIGINS or _VERCEL_REGEX.match(origin or "")))
-
-    # 預檢：直接 204
-    if request.method.upper() == "OPTIONS":
-        acrm = request.headers.get("access-control-request-method", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
-        acrh = request.headers.get("access-control-request-headers", "Authorization,Content-Type,X-Requested-With")
-        headers = {
-            "Access-Control-Allow-Origin": origin if is_allowed else "",
-            "Access-Control-Allow-Credentials": "true" if is_allowed else "false",
-            "Access-Control-Allow-Methods": acrm,
-            "Access-Control-Allow-Headers": acrh,
-            "Access-Control-Max-Age": "86400",
-            "Access-Control-Expose-Headers": "*",
-            "Vary": "Origin",
-        }
-        return Response(status_code=204, headers=headers)
-
-    # 一般請求：就算內層丟錯，也改包成 JSONResponse 再補 CORS
-    try:
-        resp = await call_next(request)
-    except HTTPException as he:
-        resp = JSONResponse({"detail": he.detail}, status_code=he.status_code)
-    except Exception:
-        resp = JSONResponse({"detail": "Internal Server Error"}, status_code=500)
-
-    if is_allowed:
-        resp.headers.setdefault("Access-Control-Allow-Origin", origin)
-        resp.headers.setdefault("Access-Control-Allow-Credentials", "true")
-        resp.headers.setdefault("Access-Control-Expose-Headers", "*")
-        vary = resp.headers.get("Vary")
-        resp.headers["Vary"] = "Origin" if not vary else (vary if "Origin" in vary else f"{vary}, Origin")
-    return resp
-
-
 # ---- 啟動時建表（若你用 Alembic 可拿掉）----
 @app.on_event("startup")
 def on_startup():
     Base.metadata.create_all(bind=engine)
-
 
 # ====== 掛載靜態與路由（CORS 已掛好）======
 # /static/av -> 影音暫存
 mount_path, static_app, name = av.get_static_mount()
 app.mount(mount_path, static_app, name)
 
-# HeyGen / DID 舊路由保留（移到 CORS 之後，確保帶到 CORS 標頭）
+# HeyGen / DID 舊路由保留
 app.include_router(did_router.router)
 
 # *** 修復：更強健的 chat router 註冊 ***
@@ -188,14 +129,6 @@ try:
     app.include_router(chat_router, prefix="/api/chat", tags=["chat"])
     chat_router_loaded = True
     print("✅ Chat router 註冊成功")
-    heygen_routes = []
-    for route in chat_router.routes:
-        if hasattr(route, 'path') and 'heygen' in route.path:
-            heygen_routes.append(route.path)
-    if heygen_routes:
-        print(f"✅ HeyGen 路由註冊成功: {heygen_routes}")
-    else:
-        print("⚠️ 警告：沒有找到 HeyGen 相關路由")
 except ImportError as e:
     chat_router_error = f"導入錯誤: {e}"
     print(f"❌ Chat router 導入失敗: {e}")
@@ -233,7 +166,7 @@ app.include_router(av.router)
 
 
 # -----------------------------------------------------------------------------
-# Schemas（保留原版）
+# Schemas（保持原樣）
 # -----------------------------------------------------------------------------
 class JoinRequest(BaseModel):
     pid: str = Field(..., min_length=1, max_length=50)
@@ -297,7 +230,7 @@ class ChatSessionEnd(BaseModel):
 
 
 # -----------------------------------------------------------------------------
-# Helper Functions（保留原版）
+# Helper Functions（保持原樣）
 # -----------------------------------------------------------------------------
 def get_system_prompt(bot_type: str) -> str:
     prompts = {
@@ -399,7 +332,7 @@ def update_session_activity(user_id: int, db: Session):
 
 
 # -----------------------------------------------------------------------------
-# Health & Debug（保留原版＋略調整）
+# Health & Debug
 # -----------------------------------------------------------------------------
 @app.get("/api/health")
 def health():
@@ -430,20 +363,11 @@ def list_all_routes():
                 "methods": list(route.methods),
                 "name": getattr(route, 'name', 'unnamed')
             })
-    return {
-        "total_routes": len(routes),
-        "routes": routes,
-        "chat_routes": [r for r in routes if '/chat/' in r['path']],
-        "heygen_routes": [r for r in routes if 'heygen' in r['path']],
-        "chat_router_status": {
-            "loaded": chat_router_loaded,
-            "error": chat_router_error
-        }
-    }
+    return {"total_routes": len(routes), "routes": routes}
 
 
 # -----------------------------------------------------------------------------
-# Auth & Profile（保留原版）
+# Auth & Profile
 # -----------------------------------------------------------------------------
 class JoinRequest(BaseModel):
     pid: str = Field(..., min_length=1, max_length=50)
@@ -495,7 +419,7 @@ def profile(user: User = Depends(get_current_user), db: Session = Depends(get_db
 
 
 # -----------------------------------------------------------------------------
-# Assessments / Matching（保留原版）
+# Assessments / Matching
 # -----------------------------------------------------------------------------
 class AssessmentUpsert(BaseModel):
     mbti_raw: Optional[str] = None
@@ -597,7 +521,7 @@ def my_match(user: User = Depends(get_current_user), db: Session = Depends(get_d
 
 
 # -----------------------------------------------------------------------------
-# Chat（保留原版）
+# Chat
 # -----------------------------------------------------------------------------
 @app.post("/api/chat/send")
 def chat_send(
@@ -658,7 +582,7 @@ def chat_send(
 
 
 # -----------------------------------------------------------------------------
-# Mood Records（保留原版）
+# Mood Records
 # -----------------------------------------------------------------------------
 @app.post("/api/mood/create")
 def create_mood_record(body: MoodRecordCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -674,7 +598,7 @@ def my_mood_records(user: User = Depends(get_current_user), db: Session = Depend
 
 
 # -----------------------------------------------------------------------------
-# Chat Messages（保留原版）
+# Chat Messages
 # -----------------------------------------------------------------------------
 @app.post("/api/chat/messages")
 def create_chat_message(body: ChatMessageCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -705,7 +629,7 @@ def my_chat_messages(user: User = Depends(get_current_user), db: Session = Depen
 
 
 # -----------------------------------------------------------------------------
-# Chat Sessions（保留原版）
+# Chat Sessions
 # -----------------------------------------------------------------------------
 @app.post("/api/chat/sessions")
 def create_chat_session(body: ChatSessionCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -739,7 +663,7 @@ def my_chat_sessions(user: User = Depends(get_current_user), db: Session = Depen
 
 
 # -----------------------------------------------------------------------------
-# Admin: Allowed PIDs（保留原版）
+# Admin: Allowed PIDs
 # -----------------------------------------------------------------------------
 @app.post("/api/admin/allowed-pids")
 def create_allowed_pid(body: AllowedPidCreate, db: Session = Depends(get_db)):
@@ -770,7 +694,7 @@ def update_allowed_pid(pid_id: int, body: AllowedPidUpdate, db: Session = Depend
 
 
 # -----------------------------------------------------------------------------
-# System Status & Root（保留原版）
+# System Status & Root
 # -----------------------------------------------------------------------------
 @app.get("/api/system/status")
 def system_status(db: Session = Depends(get_db)):
@@ -804,7 +728,7 @@ def system_status(db: Session = Depends(get_db)):
 def root():
     return {
         "service": "Emobot Backend API",
-        "version": "0.5.1",
+        "version": "0.5.2",
         "status": "running",
         "docs": "/docs",
         "health": "/api/health",
