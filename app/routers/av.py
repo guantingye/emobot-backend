@@ -6,8 +6,10 @@ from pydantic import BaseModel, Field
 import os, uuid, asyncio, io, base64, traceback
 import numpy as np
 import aiohttp
+import librosa
 from PIL import Image, ImageDraw
 from moviepy.editor import ImageClip, AudioFileClip, CompositeVideoClip
+import edge_tts
 
 router = APIRouter(prefix="/api/av", tags=["av"])
 
@@ -21,35 +23,27 @@ os.makedirs(VIDEO_DIR, exist_ok=True)
 def get_static_mount():
     return ("/static/av", StaticFiles(directory=STATIC_ROOT), "av_static")
 
-# ====== 請求模型 ======
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://emobot-plus.vercel.app").rstrip("/")
+
 class UtterReq(BaseModel):
     text: str = Field(..., min_length=1, max_length=600)
     image_url: str | None = None
     image_base64: str | None = None
-    mouth_box: list[float] | None = None   # [x,y,w,h] in 0~1
+    mouth_box: list[float] | None = None  # [x,y,w,h] in 0~1
     voice: str | None = "zh-TW-HsiaoYuNeural"
     fps: int = 30
 
-# ====== 工具函數 ======
-def _to_absolute_url(possible_url: str | None) -> str | None:
-    """把 /static/media/... 這類相對路徑補成絕對網址（用 FRONTEND_URL 當 base）"""
-    if not possible_url:
-        return None
-    u = possible_url.strip()
-    if not u:
-        return None
-    if u.startswith("http://") or u.startswith("https://") or u.startswith("data:"):
-        return u
-    base = os.environ.get("FRONTEND_URL", "").strip().rstrip("/")
-    if not base:
-        # 後備：你也可以改成你的正式站
-        base = "https://emobot-plus.vercel.app"
-    if not u.startswith("/"):
-        u = "/" + u
-    return f"{base}{u}"
+def _normalize_url(u: str | None) -> str | None:
+    if not u: return None
+    u = u.strip()
+    if u.startswith("//"):
+        return f"https:{u}"
+    if u.startswith("/"):
+        return f"{FRONTEND_URL}{u}"
+    return u
 
 async def _download_bytes(url: str) -> bytes:
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as sess:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as sess:
         async with sess.get(url) as r:
             if r.status != 200:
                 raise HTTPException(400, f"fetch image failed: {r.status}")
@@ -64,50 +58,20 @@ def _decode_base64(data_uri: str) -> bytes:
         raise HTTPException(400, "invalid base64 image")
 
 async def _tts_to_mp3(text: str, voice: str, out_path: str):
-    import edge_tts  # 延後載入，避免啟動期相依延遲
     tts = edge_tts.Communicate(text, voice=voice)
     await tts.save(out_path)
 
-def _rms_envelope_via_moviepy(audio_path: str, target_sr: int = 16000, hop: int = 512):
-    """
-    使用 moviepy 直接讀取 mp3 為 numpy，避免 librosa/soundfile 在 Render 缺 libsndfile。
-    回傳 (rms[0..1], duration_seconds)
-    """
-    clip = AudioFileClip(audio_path)
-    dur = float(clip.duration)
-    # 取樣：to_soundarray(fps) -> shape (N, 2) 或 (N,)
-    arr = clip.to_soundarray(fps=target_sr)  # [-1,1] 浮點
-    clip.close()
-    if arr.ndim == 2:
-        arr = arr.mean(axis=1)  # 轉單聲道
-    arr = arr.astype("float32")
-
-    # 分幀計算 RMS
-    n = len(arr)
-    if n == 0:
-        return np.zeros(1, dtype="float32"), dur
-    frame = 2048
-    hop = int(hop)
-    if hop <= 0:
-        hop = 512
-    starts = np.arange(0, max(1, n - frame), hop, dtype=int)
-    rms_list = []
-    for s in starts:
-        e = min(s + frame, n)
-        seg = arr[s:e]
-        if len(seg) == 0:
-            rms_list.append(0.0)
-        else:
-            rms_list.append(float(np.sqrt(np.mean(seg * seg))))
-    rms = np.array(rms_list, dtype="float32")
-    if rms.size == 0:
-        rms = np.array([0.0], dtype="float32")
-    m = rms.max()
-    if m > 0:
-        rms = rms / m
+def _rms_envelope(audio_path: str, sr: int = 22050, hop: int = 512):
+    y, sr = librosa.load(audio_path, sr=sr, mono=True)
+    rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=hop).flatten()
+    if rms.max() > 0:
+        rms = rms / rms.max()
+    times = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=hop)
+    dur = float(times[-1] if len(times) else len(y) / sr)
     return rms, dur
 
 def _make_viseme_video(img_bytes: bytes, audio_path: str, out_path: str, mouth_box: list[float] | None, fps: int):
+    from PIL import Image  # 保險：有些平台延遲匯入
     base = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
     W, H = base.size
 
@@ -119,10 +83,9 @@ def _make_viseme_video(img_bytes: bytes, audio_path: str, out_path: str, mouth_b
     Mx, My = int(mx * W), int(my * H)
     Mw, Mh = int(mw * W), int(mh * H)
 
-    # 取音量包絡線（改用 moviepy，避開 librosa 相依）
-    rms, dur = _rms_envelope_via_moviepy(audio_path)
+    rms, dur = _rms_envelope(audio_path)
     if dur <= 0:
-        dur = 1.0
+        dur = AudioFileClip(audio_path).duration
 
     min_open, max_open = 0.1, 1.0
     hop_time = dur / max(1, len(rms))
@@ -149,21 +112,20 @@ def _make_viseme_video(img_bytes: bytes, audio_path: str, out_path: str, mouth_b
     audio_clip = AudioFileClip(audio_path)
 
     final = CompositeVideoClip([dyn_clip]).set_audio(audio_clip)
+    # 讓 moviepy 使用 imageio-ffmpeg（會自帶 binary；Render 不需系統安裝）
     final.write_videofile(out_path, fps=fps, codec="libx264", audio_codec="aac", verbose=False, logger=None)
     final.close()
     audio_clip.close()
     img_clip.close()
 
-# ====== 預檢（有些代理會需要；CORSMiddleware 通常已處理）======
 @router.options("/utter")
 async def options_utter():
     return Response(status_code=204)
 
-# ====== 主要 API ======
 @router.post("/utter")
 async def utter(req: UtterReq):
     try:
-        text = req.text.strip()
+        text = (req.text or "").strip()
         if not text:
             raise HTTPException(400, "empty text")
 
@@ -175,19 +137,16 @@ async def utter(req: UtterReq):
         await _tts_to_mp3(text, req.voice or "zh-TW-HsiaoYuNeural", mp3_path)
 
         # 2) 取得圖片
-        img_bytes: bytes | None = None
-        if req.image_base64:
+        if req.image_url:
+            img_url = _normalize_url(req.image_url)
+            if not (img_url.startswith("http://") or img_url.startswith("https://")):
+                raise HTTPException(400, f"invalid image_url: {img_url}")
+            img_bytes = await _download_bytes(img_url)
+        elif req.image_base64:
             img_bytes = _decode_base64(req.image_base64)
-        elif req.image_url:
-            abs_url = _to_absolute_url(req.image_url)
-            try:
-                img_bytes = await _download_bytes(abs_url)
-            except Exception as e:
-                # 抓圖失敗就降級為 fallback，不再 500
-                img_bytes = None
-
-        if img_bytes is None:
+        else:
             # fallback：簡單底圖
+            from PIL import Image
             W, H = 900, 1200
             fallback = Image.new("RGBA", (W, H), (245, 247, 250, 255))
             d = ImageDraw.Draw(fallback)
@@ -196,19 +155,20 @@ async def utter(req: UtterReq):
             fallback.save(bio, format="PNG")
             img_bytes = bio.getvalue()
 
-        # 3) 產生影片
+        # 3) 產生影片（同步嘴型）
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, _make_viseme_video, img_bytes, mp3_path, mp4_path, req.mouth_box, req.fps)
 
         video_url = f"/static/av/video/{os.path.basename(mp4_path)}"
         audio_url = f"/static/av/audio/{os.path.basename(mp3_path)}"
         return JSONResponse({"ok": True, "video_url": video_url, "audio_url": audio_url})
+
     except HTTPException as he:
-        # 保持語意化錯誤
-        return JSONResponse({"ok": False, "error": str(he.detail)}, status_code=he.status_code)
+        # 直接回傳具體錯誤
+        return JSONResponse({"ok": False, "detail": he.detail}, status_code=he.status_code)
     except Exception as e:
-        # 回傳可讀錯誤訊息，避免 500 毫無資訊
+        # 把重點錯誤帶回前端方便除錯
         err = f"{e.__class__.__name__}: {e}"
-        print("AV/utter error:", err)
+        print("／api/av/utter error:", err)
         traceback.print_exc()
-        return JSONResponse({"ok": False, "error": err}, status_code=500)
+        return JSONResponse({"ok": False, "detail": err}, status_code=500)
