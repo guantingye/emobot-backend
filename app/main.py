@@ -19,7 +19,7 @@ from app.core.config import settings
 from app.core.security import create_access_token, get_current_user
 from app.db.session import get_db, engine
 from app.db.base import Base
-
+from app.routers import av 
 from app.models.user import User
 from app.models.assessment import Assessment
 from app.models.recommendation import Recommendation
@@ -231,7 +231,12 @@ if not chat_router_loaded:
     app.include_router(emergency_router, prefix="/api/chat", tags=["emergency"])
     print("🚨 緊急備用路由已啟動")
 
+# 掛載開源影音靜態檔
+mount_path, static_app, name = av.get_static_mount()
+app.mount(mount_path, static_app, name)
 
+# 新增 /api/av 路由
+app.include_router(av.router)
 # -----------------------------------------------------------------------------
 # Schemas
 # -----------------------------------------------------------------------------
