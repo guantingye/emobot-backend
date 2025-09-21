@@ -1,15 +1,21 @@
 # app/routers/av.py
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, HTTPException, Response
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import os, uuid, asyncio, io, base64, traceback
 import numpy as np
 import aiohttp
+import httpx
 import librosa
 from PIL import Image, ImageDraw
 from moviepy.editor import ImageClip, AudioFileClip, CompositeVideoClip
-import edge_tts
+
+# edge-tts 當作備援
+try:
+    import edge_tts
+except Exception:
+    edge_tts = None
 
 router = APIRouter(prefix="/api/av", tags=["av"])
 
@@ -30,9 +36,10 @@ class UtterReq(BaseModel):
     image_url: str | None = None
     image_base64: str | None = None
     mouth_box: list[float] | None = None  # [x,y,w,h] in 0~1
-    voice: str | None = "zh-TW-HsiaoYuNeural"
+    voice: str | None = None              # 使用者指定，OpenAI/edge 會各自映射
     fps: int = 30
 
+# -------------------- utils --------------------
 def _normalize_url(u: str | None) -> str | None:
     if not u: return None
     u = u.strip()
@@ -57,21 +64,90 @@ def _decode_base64(data_uri: str) -> bytes:
     except Exception:
         raise HTTPException(400, "invalid base64 image")
 
-async def _tts_to_mp3(text: str, voice: str, out_path: str):
-    tts = edge_tts.Communicate(text, voice=voice)
+# -------------------- TTS backends --------------------
+async def _openai_tts_to_mp3(text: str, out_path: str, voice: str | None = None):
+    """
+    使用 OpenAI TTS（預設）：
+    - 需環境變數 OPENAI_API_KEY
+    - OPENAI_TTS_MODEL（預設 gpt-4o-mini-tts）
+    - OPENAI_TTS_VOICE（預設 alloy）
+    """
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY not set")
+
+    model = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
+    ov = (voice or os.getenv("OPENAI_TTS_VOICE") or "alloy")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "input": text,
+        "voice": ov,
+        "format": "mp3",
+    }
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post("https://api.openai.com/v1/audio/speech", headers=headers, json=payload)
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"openai tts failed: {r.status_code} {r.text[:200]}")
+        with open(out_path, "wb") as f:
+            f.write(r.content)
+
+async def _edge_tts_to_mp3(text: str, out_path: str, voice: str | None = None):
+    """
+    備援：edge-tts
+    - voice 未指定時使用 zh-TW-HsiaoYuNeural
+    - 某些雲環境可能被 403 拒絕（正是你這次遇到），所以僅作 fallback
+    """
+    if not edge_tts:
+        raise RuntimeError("edge-tts not installed")
+
+    chosen = voice or "zh-TW-HsiaoYuNeural"
+    tts = edge_tts.Communicate(text, voice=chosen)
     await tts.save(out_path)
 
+async def _tts_to_mp3(text: str, out_path: str, voice: str | None = None):
+    """
+    先嘗試 OpenAI → 失敗再回退 edge-tts
+    可用環境變數 TTS_BACKEND=openai|edge 強制選擇。
+    """
+    backend = (os.getenv("TTS_BACKEND") or "openai").lower()
+    last_err = None
+
+    if backend in ("openai", "auto"):
+        try:
+            await _openai_tts_to_mp3(text, out_path, voice=voice)
+            return
+        except Exception as e:
+            last_err = e
+            print("[TTS] OpenAI TTS failed, fallback to edge-tts:", repr(e))
+
+    if backend in ("edge", "auto", "openai"):  # openai 失敗才落到 edge
+        try:
+            await _edge_tts_to_mp3(text, out_path, voice=voice)
+            return
+        except Exception as e:
+            last_err = e
+            print("[TTS] edge-tts failed:", repr(e))
+
+    # 都失敗
+    if last_err:
+        raise HTTPException(status_code=502, detail=f"tts failed: {last_err}")
+
+# -------------------- lipsync video --------------------
 def _rms_envelope(audio_path: str, sr: int = 22050, hop: int = 512):
     y, sr = librosa.load(audio_path, sr=sr, mono=True)
     rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=hop).flatten()
-    if rms.max() > 0:
+    if rms.size > 0 and rms.max() > 0:
         rms = rms / rms.max()
     times = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=hop)
     dur = float(times[-1] if len(times) else len(y) / sr)
     return rms, dur
 
 def _make_viseme_video(img_bytes: bytes, audio_path: str, out_path: str, mouth_box: list[float] | None, fps: int):
-    from PIL import Image  # 保險：有些平台延遲匯入
     base = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
     W, H = base.size
 
@@ -93,7 +169,7 @@ def _make_viseme_video(img_bytes: bytes, audio_path: str, out_path: str, mouth_b
     def open_ratio_at(t: float) -> float:
         idx = int(t / hop_time)
         idx = max(0, min(len(rms) - 1, idx))
-        r = float(rms[idx]) ** 0.65
+        r = float(rms[idx]) ** 0.65 if len(rms) else 0.0
         return min_open + (max_open - min_open) * r
 
     base_np = np.array(base)
@@ -112,12 +188,13 @@ def _make_viseme_video(img_bytes: bytes, audio_path: str, out_path: str, mouth_b
     audio_clip = AudioFileClip(audio_path)
 
     final = CompositeVideoClip([dyn_clip]).set_audio(audio_clip)
-    # 讓 moviepy 使用 imageio-ffmpeg（會自帶 binary；Render 不需系統安裝）
+    # 使用 imageio-ffmpeg（Render 不需要系統 ffmpeg）
     final.write_videofile(out_path, fps=fps, codec="libx264", audio_codec="aac", verbose=False, logger=None)
     final.close()
     audio_clip.close()
     img_clip.close()
 
+# -------------------- routes --------------------
 @router.options("/utter")
 async def options_utter():
     return Response(status_code=204)
@@ -133,8 +210,8 @@ async def utter(req: UtterReq):
         mp3_path = os.path.join(AUDIO_DIR, f"{vid_id}.mp3")
         mp4_path = os.path.join(VIDEO_DIR, f"{vid_id}.mp4")
 
-        # 1) TTS
-        await _tts_to_mp3(text, req.voice or "zh-TW-HsiaoYuNeural", mp3_path)
+        # 1) TTS（OpenAI → edge 備援）
+        await _tts_to_mp3(text, mp3_path, voice=req.voice)
 
         # 2) 取得圖片
         if req.image_url:
@@ -146,7 +223,6 @@ async def utter(req: UtterReq):
             img_bytes = _decode_base64(req.image_base64)
         else:
             # fallback：簡單底圖
-            from PIL import Image
             W, H = 900, 1200
             fallback = Image.new("RGBA", (W, H), (245, 247, 250, 255))
             d = ImageDraw.Draw(fallback)
@@ -164,11 +240,9 @@ async def utter(req: UtterReq):
         return JSONResponse({"ok": True, "video_url": video_url, "audio_url": audio_url})
 
     except HTTPException as he:
-        # 直接回傳具體錯誤
         return JSONResponse({"ok": False, "detail": he.detail}, status_code=he.status_code)
     except Exception as e:
-        # 把重點錯誤帶回前端方便除錯
         err = f"{e.__class__.__name__}: {e}"
-        print("／api/av/utter error:", err)
+        print("/api/av/utter error:", err)
         traceback.print_exc()
         return JSONResponse({"ok": False, "detail": err}, status_code=500)
