@@ -28,6 +28,7 @@ from app.models.mood import MoodRecord
 from app.models.allowed_pid import AllowedPid
 from app.models.chat_session import ChatSession
 from app.routers import did_router
+
 # ---- Optional: 外部推薦引擎，失敗時走 fallback ----
 try:
     from app.services.recommendation_engine import recommend_endpoint_payload as _build_reco

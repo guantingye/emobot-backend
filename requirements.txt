@@ -30,11 +30,13 @@ isort==5.12.0
 # 生產環境
 gunicorn==21.2.0
 
-# === lipsync / TTS 追加 ===
-edge-tts==6.1.12
-pydub==0.25.1
+edge-tts==6.1.9
+librosa==0.10.1
+soundfile==0.12.1
 numpy==1.26.4
-opencv-python-headless==4.9.0.80
-imageio==2.35.1
-imageio-ffmpeg==0.5.1
-aiofiles==24.1.0
+Pillow==10.4.0
+moviepy==1.0.3
+imageio==2.34.1
+imageio-ffmpeg==0.4.9
+aiofiles==23.2.1
+requests==2.32.3
