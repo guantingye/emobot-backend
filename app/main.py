@@ -28,6 +28,9 @@ from app.models.mood import MoodRecord
 from app.models.allowed_pid import AllowedPid
 from app.models.chat_session import ChatSession
 from app.routers import did_router
+
+from fastapi.staticfiles import StaticFiles
+from app.routers import av_lipsync  # 新增：引入上面的 router
 # ---- Optional: 外部推薦引擎，失敗時走 fallback ----
 try:
     from app.services.recommendation_engine import recommend_endpoint_payload as _build_reco
@@ -90,8 +93,8 @@ def build_recommendation_payload(user: Dict[str, Any] | None, assessment: Dict[s
 # -----------------------------------------------------------------------------
 
 app = FastAPI(title="Emobot Backend", version="0.5.0")
-
-app.include_router(did_router.router)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+app.include_router(av_lipsync.router)
 # ---- CORS（官方 + 強化補丁）----
 ALLOWED = getattr(settings, "ALLOWED_ORIGINS", os.getenv(
     "ALLOWED_ORIGINS",
