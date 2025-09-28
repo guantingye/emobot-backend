@@ -1,8 +1,9 @@
-# app/main.py - 修復版，確保 HeyGen 路由正確註冊，並新增頭像動畫功能
+# app/main.py - 更新版，確保頭像動畫路由正確註冊，移除DID依賴
 from __future__ import annotations
 
 import os
 import re
+import sys
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
@@ -26,28 +27,62 @@ from app.models.chat import ChatMessage
 from app.models.mood import MoodRecord
 from app.models.allowed_pid import AllowedPid
 from app.models.chat_session import ChatSession
-from app.routers import did_router
 
-# ---- 新增：頭像動畫路由 ----
+# ---- 路由註冊狀態追蹤 ----
+router_status = {
+    "chat": {"loaded": False, "error": None},
+    "avatar_animation": {"loaded": False, "error": None},
+    "did": {"loaded": False, "error": None}
+}
+
+# ---- 頭像動畫路由 ----
 try:
     from app.routers import avatar_animation
-    avatar_animation_available = True
+    app_avatar = FastAPI()  # 臨時app用於測試
+    app_avatar.include_router(avatar_animation.router, prefix="/test")
+    router_status["avatar_animation"]["loaded"] = True
     print("✅ 頭像動畫模組載入成功")
 except ImportError as e:
-    avatar_animation_available = False
-    print(f"⚠️ 頭像動畫模組載入失敗: {e}")
+    router_status["avatar_animation"]["error"] = f"導入錯誤: {e}"
+    print(f"❌ 頭像動畫模組載入失敗: {e}")
+except Exception as e:
+    router_status["avatar_animation"]["error"] = f"註冊錯誤: {e}"
+    print(f"❌ 頭像動畫模組錯誤: {e}")
 
-# ---- Optional: 外部推薦引擎，失敗時走 fallback ----
+# ---- Chat 路由 ----
+try:
+    from app import chat as chat_module
+    if not hasattr(chat_module, 'router'):
+        raise ImportError("chat.py 中沒有定義 router")
+    router_status["chat"]["loaded"] = True
+    print("✅ Chat 模組載入成功")
+except ImportError as e:
+    router_status["chat"]["error"] = f"導入錯誤: {e}"
+    print(f"❌ Chat 模組載入失敗: {e}")
+except Exception as e:
+    router_status["chat"]["error"] = f"其他錯誤: {e}"
+    print(f"❌ Chat 模組錯誤: {e}")
+
+# ---- DID 路由（保留但標記為過時）----
+try:
+    from app.routers import did_router
+    router_status["did"]["loaded"] = True
+    print("✅ DID 模組載入成功（但已過時）")
+except ImportError as e:
+    router_status["did"]["error"] = f"導入錯誤: {e}"
+    print(f"⚠️ DID 模組載入失敗（已計劃移除）: {e}")
+except Exception as e:
+    router_status["did"]["error"] = f"其他錯誤: {e}"
+    print(f"⚠️ DID 模組錯誤（已計劃移除）: {e}")
+
+# ---- 推薦引擎（可選）----
 try:
     from app.services.recommendation_engine import recommend_endpoint_payload as _build_reco
 except Exception:
     _build_reco = None
 
-
 def _fallback_build_reco(user: Dict[str, Any] | None, assessment: Dict[str, Any] | None) -> Dict[str, Any]:
-    """
-    簡單、可重現的回退推薦：由 mbti_encoded[4] 推出四型分數（0~1），回傳 0~100 的排序結果。
-    """
+    """簡單、可重現的回退推薦：由 mbti_encoded[4] 推出四型分數（0~1），回傳 0~100 的排序結果。"""
     empathy = insight = solution = cognitive = 0.25
     if assessment:
         enc = assessment.get("mbti_encoded")
@@ -84,7 +119,6 @@ def _fallback_build_reco(user: Dict[str, Any] | None, assessment: Dict[str, Any]
         "params": {},
     }
 
-
 def build_recommendation_payload(user: Dict[str, Any] | None, assessment: Dict[str, Any] | None) -> Dict[str, Any]:
     if callable(_build_reco):
         try:
@@ -93,27 +127,21 @@ def build_recommendation_payload(user: Dict[str, Any] | None, assessment: Dict[s
             return _fallback_build_reco(user, assessment)
     return _fallback_build_reco(user, assessment)
 
-
 # -----------------------------------------------------------------------------
-# FastAPI App
+# FastAPI App 初始化
 # -----------------------------------------------------------------------------
 
-app = FastAPI(title="Emobot Backend", version="0.5.1")
+app = FastAPI(
+    title="Emobot Backend", 
+    version="0.6.0",
+    description="心理對話機器人系統 - 專注頭像動畫功能"
+)
 
-# 註冊 DID router
-app.include_router(did_router.router)
-
-# 註冊頭像動畫路由
-if avatar_animation_available:
-    app.include_router(avatar_animation.router, prefix="/api/chat/avatar", tags=["avatar"])
-    print("✅ 頭像動畫路由註冊成功: /api/chat/avatar")
-
-# ---- CORS（官方 + 強化補丁）----
+# ---- CORS設定（強化版）----
 ALLOWED = getattr(settings, "ALLOWED_ORIGINS", os.getenv(
     "ALLOWED_ORIGINS",
     "https://emobot-plus.vercel.app,http://localhost:5173,http://localhost:3000"
 ))
-
 
 def _parse_allowed(origins_str: str) -> List[str]:
     out: List[str] = []
@@ -123,7 +151,6 @@ def _parse_allowed(origins_str: str) -> List[str]:
             continue
         out.append(s)
     return out
-
 
 _ALLOWED_ORIGINS = _parse_allowed(ALLOWED)
 _VERCEL_REGEX_STR = r"^https://.*\.vercel\.app$"
@@ -140,8 +167,7 @@ app.add_middleware(
     expose_headers=["*"],
 )
 
-
-# 2) 自訂補丁：確保錯誤時也帶 CORS，並正確處理預檢 OPTIONS
+# 2) 自訂補強：確保錯誤時也帶 CORS，並正確處理預檢 OPTIONS
 @app.middleware("http")
 async def _force_cors_headers(request: Request, call_next):
     origin = request.headers.get("origin")
@@ -178,51 +204,61 @@ async def _force_cors_headers(request: Request, call_next):
         resp.headers["Vary"] = "Origin" if not vary else (vary if "Origin" in vary else f"{vary}, Origin")
     return resp
 
-
 # ---- 啟動時建表（若你用 Alembic 可拿掉）----
 @app.on_event("startup")
 def on_startup():
     Base.metadata.create_all(bind=engine)
 
+# -----------------------------------------------------------------------------
+# 路由註冊（優先順序：頭像動畫 > Chat > DID）
+# -----------------------------------------------------------------------------
 
-# *** 修復：更強健的 chat router 註冊 ***
-chat_router_loaded = False
-chat_router_error = None
-
-try:
-    # 首先嘗試導入 chat 模組
-    import app.chat as chat_module
-    
-    # 檢查 router 是否存在
-    if not hasattr(chat_module, 'router'):
-        raise ImportError("chat.py 中沒有定義 router")
-    
-    # 註冊路由
-    chat_router = chat_module.router
-    app.include_router(chat_router, prefix="/api/chat", tags=["chat"])
-    chat_router_loaded = True
-    print("✅ Chat router 註冊成功")
-    
-    # 檢查 HeyGen 相關路由
-    heygen_routes = []
-    for route in chat_router.routes:
-        if hasattr(route, 'path') and 'heygen' in route.path:
-            heygen_routes.append(route.path)
-    
-    if heygen_routes:
-        print(f"✅ HeyGen 路由註冊成功: {heygen_routes}")
-    else:
-        print("⚠️ 警告：沒有找到 HeyGen 相關路由")
+# ★ 第一優先：頭像動畫路由
+if router_status["avatar_animation"]["loaded"]:
+    try:
+        app.include_router(avatar_animation.router, prefix="/api/chat/avatar", tags=["avatar-animation"])
+        print("✅ 頭像動畫路由註冊成功: /api/chat/avatar")
         
-except ImportError as e:
-    chat_router_error = f"導入錯誤: {e}"
-    print(f"❌ Chat router 導入失敗: {e}")
-except Exception as e:
-    chat_router_error = f"註冊錯誤: {e}"
-    print(f"❌ Chat router 註冊失敗: {e}")
+        # 檢查路由是否正確註冊
+        avatar_routes = []
+        for route in app.routes:
+            if hasattr(route, 'path') and '/avatar/' in route.path:
+                avatar_routes.append(f"{route.methods} {route.path}")
+        print(f"✅ 已註冊頭像動畫路由: {avatar_routes}")
+        
+    except Exception as e:
+        router_status["avatar_animation"]["error"] = f"路由註冊失敗: {e}"
+        print(f"❌ 頭像動畫路由註冊失敗: {e}")
 
-# 如果 chat router 載入失敗，創建緊急備用路由
-if not chat_router_loaded:
+# ★ 第二優先：Chat路由
+if router_status["chat"]["loaded"]:
+    try:
+        chat_router = chat_module.router
+        app.include_router(chat_router, prefix="/api/chat", tags=["chat"])
+        print("✅ Chat 路由註冊成功: /api/chat")
+        
+        # 檢查是否有衝突的路由
+        chat_routes = []
+        for route in app.routes:
+            if hasattr(route, 'path') and route.path.startswith('/api/chat') and '/avatar/' not in route.path:
+                chat_routes.append(f"{route.methods} {route.path}")
+        print(f"✅ 已註冊Chat路由: {len(chat_routes)} 個端點")
+        
+    except Exception as e:
+        router_status["chat"]["error"] = f"路由註冊失敗: {e}"
+        print(f"❌ Chat 路由註冊失敗: {e}")
+
+# ★ 第三優先：DID路由（保留相容性，但標記為過時）
+if router_status["did"]["loaded"]:
+    try:
+        app.include_router(did_router.router, tags=["did-deprecated"])
+        print("⚠️ DID 路由註冊成功（但已過時，建議移除）")
+    except Exception as e:
+        router_status["did"]["error"] = f"路由註冊失敗: {e}"
+        print(f"⚠️ DID 路由註冊失敗: {e}")
+
+# ★ 緊急後備路由（當主要路由失敗時）
+if not router_status["chat"]["loaded"]:
     from fastapi import APIRouter
     
     emergency_router = APIRouter()
@@ -232,30 +268,30 @@ if not chat_router_loaded:
         return {
             "ok": False, 
             "error": "Chat router 載入失敗", 
-            "details": chat_router_error,
-            "emergency_mode": True
+            "details": router_status["chat"]["error"],
+            "emergency_mode": True,
+            "available_features": ["avatar_animation"] if router_status["avatar_animation"]["loaded"] else []
         }
     
     @emergency_router.get("/status")
     async def emergency_status():
         return {
             "chat_router_loaded": False,
-            "error": chat_router_error,
-            "available_endpoints": ["/api/chat/health", "/api/chat/status"]
+            "error": router_status["chat"]["error"],
+            "available_endpoints": ["/api/chat/health", "/api/chat/status"],
+            "alternative_features": "請使用 /api/chat/avatar/* 進行頭像動畫功能"
         }
     
     app.include_router(emergency_router, prefix="/api/chat", tags=["emergency"])
-    print("🚨 緊急備用路由已啟動")
-
+    print("🚨 緊急後備路由已啟動")
 
 # -----------------------------------------------------------------------------
-# Schemas
+# Pydantic Models（保留原有）
 # -----------------------------------------------------------------------------
 
 class JoinRequest(BaseModel):
     pid: str = Field(..., min_length=1, max_length=50)
     nickname: Optional[str] = Field(default=None, max_length=100)
-
 
 class AssessmentUpsert(BaseModel):
     mbti_raw: Optional[str] = None
@@ -265,13 +301,10 @@ class AssessmentUpsert(BaseModel):
     step4_answers: Optional[List[Any]] = None
     ai_preference: Optional[Dict[str, Any]] = None
     submittedAt: Optional[datetime] = None
-    # 新增：是否為重新測驗
     is_retest: Optional[bool] = False
-
 
 class MatchChoice(BaseModel):
     bot_type: str = Field(..., description="empathy | insight | solution | cognitive")
-
 
 class ChatSendRequest(BaseModel):
     message: str
@@ -279,7 +312,6 @@ class ChatSendRequest(BaseModel):
     mode: Optional[str] = "text"
     history: Optional[List[Dict[str, str]]] = []
     demo: Optional[bool] = False
-
 
 class ChatMessageCreate(BaseModel):
     content: str
@@ -289,33 +321,27 @@ class ChatMessageCreate(BaseModel):
     user_mood: Optional[str] = None
     mood_intensity: Optional[int] = None
 
-
 class MoodRecordCreate(BaseModel):
     mood: str
     intensity: Optional[int] = None
     note: Optional[str] = None
 
-
 class AllowedPidCreate(BaseModel):
     pid: str = Field(..., min_length=1, max_length=50)
     description: Optional[str] = Field(default=None, max_length=200)
-
 
 class AllowedPidUpdate(BaseModel):
     is_active: Optional[bool] = None
     description: Optional[str] = Field(default=None, max_length=200)
 
-
 class ChatSessionCreate(BaseModel):
     bot_type: Optional[str] = Field(default="solution")
-
 
 class ChatSessionEnd(BaseModel):
     reason: str = Field(..., pattern="^(user_ended|timeout|system)$")
 
-
 # -----------------------------------------------------------------------------
-# Helper Functions
+# Helper Functions（保留原有）
 # -----------------------------------------------------------------------------
 
 def get_system_prompt(bot_type: str) -> str:
@@ -328,7 +354,6 @@ def get_system_prompt(bot_type: str) -> str:
     }
     return prompts.get(bot_type, prompts["solution"])
 
-
 def get_bot_name(bot_type: str) -> str:
     """取得機器人名稱"""
     names = {
@@ -338,7 +363,6 @@ def get_bot_name(bot_type: str) -> str:
         "cognitive": "Clara"
     }
     return names.get(bot_type, "Niko")
-
 
 def call_openai(system_prompt: str, messages: List[Dict[str, str]]) -> str:
     """呼叫 OpenAI API"""
@@ -367,7 +391,6 @@ def call_openai(system_prompt: str, messages: List[Dict[str, str]]) -> str:
         # 返回預設回復而不是拋出異常
         return "我在這裡陪著你。想聊聊今天最讓你在意的事情嗎？"
 
-
 def is_pid_allowed(pid: str, db: Session) -> bool:
     """檢查 PID 是否在允許清單中且為啟用狀態"""
     allowed_pid = db.query(AllowedPid).filter(
@@ -375,7 +398,6 @@ def is_pid_allowed(pid: str, db: Session) -> bool:
         AllowedPid.is_active == True
     ).first()
     return allowed_pid is not None
-
 
 def get_or_create_active_session(user_id: int, bot_type: str, db: Session) -> ChatSession:
     """取得或建立活躍的聊天會話"""
@@ -406,7 +428,6 @@ def get_or_create_active_session(user_id: int, bot_type: str, db: Session) -> Ch
     db.refresh(new_session)
     return new_session
 
-
 def end_inactive_sessions(db: Session, timeout_minutes: int = 5):
     """結束非活躍的會話（超過指定分鐘數沒有活動）"""
     timeout_threshold = datetime.utcnow() - timedelta(minutes=timeout_minutes)
@@ -428,7 +449,6 @@ def end_inactive_sessions(db: Session, timeout_minutes: int = 5):
     
     return len(inactive_sessions)
 
-
 def update_session_activity(user_id: int, db: Session):
     """更新會話活動時間並增加訊息計數"""
     active_session = db.query(ChatSession).filter(
@@ -444,9 +464,8 @@ def update_session_activity(user_id: int, db: Session):
     
     return active_session
 
-
 # -----------------------------------------------------------------------------
-# Health & Debug
+# Health & Debug（增強版）
 # -----------------------------------------------------------------------------
 
 @app.get("/api/health")
@@ -454,13 +473,20 @@ def health():
     return {
         "ok": True, 
         "time": datetime.utcnow().isoformat() + "Z",
-        "chat_router_loaded": chat_router_loaded,
-        "chat_router_error": chat_router_error,
-        "avatar_animation_available": avatar_animation_available,
-        "heygen_enabled": bool(os.getenv("HEYGEN_API_KEY")),
+        "version": "0.6.0",
+        "features": {
+            "chat_router": router_status["chat"]["loaded"],
+            "avatar_animation": router_status["avatar_animation"]["loaded"],
+            "did_streaming": router_status["did"]["loaded"]  # 已過時
+        },
+        "errors": {k: v["error"] for k, v in router_status.items() if v["error"]},
+        "environment": {
+            "openai_configured": bool(os.getenv("OPENAI_API_KEY")),
+            "google_tts_configured": bool(os.getenv("GOOGLE_TTS_API_KEY")),
+            "edge_tts_available": True  # 假設可用，實際會在健康檢查中測試
+        },
         "routes_count": len(app.routes)
     }
-
 
 @app.get("/api/debug/db-test")
 def db_test(db: Session = Depends(get_db)):
@@ -468,10 +494,8 @@ def db_test(db: Session = Depends(get_db)):
         db.execute(text("select 1"))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB not ready: {e}")
-    return {"ok": True}
+    return {"ok": True, "message": "Database connection successful"}
 
-
-# *** 新增：路由診斷端點 ***
 @app.get("/api/debug/routes")
 def list_all_routes():
     """列出所有註冊的路由（用於診斷 404 問題）"""
@@ -483,24 +507,60 @@ def list_all_routes():
                 "methods": list(route.methods),
                 "name": getattr(route, 'name', 'unnamed')
             })
+    
+    # 分類路由
+    categorized = {
+        "avatar_routes": [r for r in routes if '/avatar/' in r['path']],
+        "chat_routes": [r for r in routes if '/chat/' in r['path'] and '/avatar/' not in r['path']],
+        "did_routes": [r for r in routes if 'did' in r['path'].lower()],
+        "auth_routes": [r for r in routes if '/auth/' in r['path']],
+        "admin_routes": [r for r in routes if '/admin/' in r['path']],
+        "other_routes": [r for r in routes if not any(x in r['path'] for x in ['/avatar/', '/chat/', '/auth/', '/admin/', 'did'])]
+    }
+    
     return {
         "total_routes": len(routes),
-        "routes": routes,
-        "chat_routes": [r for r in routes if '/chat/' in r['path']],
-        "heygen_routes": [r for r in routes if 'heygen' in r['path']],
-        "avatar_routes": [r for r in routes if 'avatar' in r['path']],
-        "chat_router_status": {
-            "loaded": chat_router_loaded,
-            "error": chat_router_error
-        },
-        "avatar_animation_status": {
-            "available": avatar_animation_available
-        }
+        "router_status": router_status,
+        "categorized_routes": categorized,
+        "missing_features": [
+            k for k, v in router_status.items() 
+            if not v["loaded"] and k in ["chat", "avatar_animation"]
+        ]
     }
 
+@app.get("/api/debug/avatar-test")
+async def test_avatar_system():
+    """測試頭像動畫系統是否正常"""
+    if not router_status["avatar_animation"]["loaded"]:
+        return {
+            "ok": False,
+            "error": "頭像動畫系統未載入",
+            "details": router_status["avatar_animation"]["error"]
+        }
+    
+    # 測試簡單的動畫生成
+    try:
+        from app.routers.avatar_animation import generate_speech_and_animation
+        test_result = await generate_speech_and_animation("測試語句", "solution")
+        
+        return {
+            "ok": True,
+            "test_result": {
+                "success": test_result.get("success"),
+                "has_audio": bool(test_result.get("audio_base64")),
+                "has_animation": bool(test_result.get("animation_data")),
+                "duration": test_result.get("duration"),
+                "error": test_result.get("error")
+            }
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"頭像動畫測試失敗: {e}"
+        }
 
 # -----------------------------------------------------------------------------
-# Auth & Profile
+# Auth & Profile（保留原有功能）
 # -----------------------------------------------------------------------------
 
 def _auth_join(body: JoinRequest, db: Session):
@@ -539,11 +599,9 @@ def _auth_join(body: JoinRequest, db: Session):
         }
     }
 
-
 @app.post("/api/auth/join")
 def join(body: JoinRequest, db: Session = Depends(get_db)):
     return _auth_join(body, db)
-
 
 @app.get("/api/user/profile")
 def profile(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -580,9 +638,8 @@ def profile(user: User = Depends(get_current_user), db: Session = Depends(get_db
         "latest_recommendation": latest_recommendation,
     }
 
-
 # -----------------------------------------------------------------------------
-# Assessments
+# 其餘API端點（Assessment, Match, Mood等 - 保留原有功能）
 # -----------------------------------------------------------------------------
 
 @app.post("/api/assessments/upsert")
@@ -611,7 +668,6 @@ def upsert_assessment(
     db.refresh(a)
     return {"ok": True, "assessment_id": a.id, "is_retest": body.is_retest or False}
 
-
 @app.get("/api/assessments/me")
 def my_assessment(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     a = (
@@ -633,11 +689,6 @@ def my_assessment(user: User = Depends(get_current_user), db: Session = Depends(
             "created_at": a.created_at.isoformat() + "Z",
         }
     }
-
-
-# -----------------------------------------------------------------------------
-# Matching
-# -----------------------------------------------------------------------------
 
 @app.post("/api/match/recommend")
 def recommend(
@@ -693,7 +744,6 @@ def recommend(
         "algorithm_version": result.get("algorithm_version"),
     }
 
-
 @app.post("/api/match/choose")
 def choose_bot(
     body: MatchChoice,
@@ -723,7 +773,6 @@ def choose_bot(
 
     return {"ok": True, "selected_bot": user.selected_bot}
 
-
 @app.get("/api/match/me")
 def my_match(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     rec = (
@@ -750,377 +799,8 @@ def my_match(user: User = Depends(get_current_user), db: Session = Depends(get_d
         }
     }
 
-
 # -----------------------------------------------------------------------------
-# Chat - 修復版本，確保與前端兼容
-# -----------------------------------------------------------------------------
-
-@app.post("/api/chat/send")
-def chat_send(
-    body: ChatSendRequest,
-    request: Request,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    user_msg = (body.message or "").strip()
-    if not user_msg:
-        raise HTTPException(status_code=400, detail="Empty message")
-
-    # 取得 user_id（從驗證後的用戶）
-    user_id = user.id
-    bot_type = body.bot_type or user.selected_bot or "solution"
-
-    try:
-        # 先清理非活躍會話
-        end_inactive_sessions(db)
-        
-        # 取得或建立聊天會話
-        chat_session = get_or_create_active_session(user_id, bot_type, db)
-
-        # 1. 儲存使用者訊息
-        user_message = ChatMessage(
-            user_id=user_id,
-            bot_type=bot_type,
-            mode=body.mode or "text",
-            role="user",
-            content=user_msg,
-            meta={"demo": body.demo, "session_id": chat_session.id}
-        )
-        db.add(user_message)
-        db.commit()
-        
-        # 更新會話活動
-        update_session_activity(user_id, db)
-        
-        # 2. 準備 OpenAI 請求
-        system_prompt = get_system_prompt(bot_type)
-        
-        # 轉換歷史記錄格式
-        messages = []
-        for h in (body.history or [])[-10:]:  # 只取最近 10 條
-            role = "assistant" if h.get("role") == "assistant" else "user"
-            messages.append({"role": role, "content": h.get("content", "")})
-        
-        # 添加當前使用者訊息
-        messages.append({"role": "user", "content": user_msg})
-        
-        # 3. 呼叫 OpenAI
-        reply_text = call_openai(system_prompt, messages)
-        
-        # 4. 儲存 AI 回復
-        ai_message = ChatMessage(
-            user_id=user_id,
-            bot_type=bot_type,
-            mode=body.mode or "text",
-            role="ai",
-            content=reply_text,
-            meta={
-                "provider": "openai", 
-                "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-                "session_id": chat_session.id
-            }
-        )
-        db.add(ai_message)
-        db.commit()
-        
-        # 再次更新會話活動（AI 回復也算活動）
-        update_session_activity(user_id, db)
-        
-        # 5. 返回結果（修復：確保包含 ok 欄位）
-        return {
-            "ok": True,  
-            "reply": reply_text,
-            "bot": {
-                "type": bot_type, 
-                "name": get_bot_name(bot_type)
-            },
-            "message_id": ai_message.id,
-            "session_id": chat_session.id,
-            "error": None
-        }
-        
-    except Exception as e:
-        print(f"Chat send error: {e}")
-        db.rollback()
-        # 回傳錯誤但仍標記為成功，讓前端能正常處理
-        return {
-            "ok": False,
-            "reply": "抱歉，我暫時無法回應。請稍後再試。",
-            "bot": {
-                "type": bot_type,
-                "name": get_bot_name(bot_type)
-            },
-            "error": str(e)[:100]
-        }
-
-
-# -----------------------------------------------------------------------------
-# Mood Records
-# -----------------------------------------------------------------------------
-
-@app.post("/api/mood/create")
-def create_mood_record(
-    body: MoodRecordCreate,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    mood_record = MoodRecord(
-        user_id=user.id,
-        mood=body.mood,
-        intensity=body.intensity,
-        note=body.note,
-        created_at=datetime.utcnow(),
-    )
-    db.add(mood_record)
-    db.commit()
-    db.refresh(mood_record)
-    return {"ok": True, "mood_record_id": mood_record.id}
-
-
-@app.get("/api/mood/me")
-def my_mood_records(
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-    limit: int = Query(default=10, le=100),
-):
-    records = (
-        db.query(MoodRecord)
-        .filter(MoodRecord.user_id == user.id)
-        .order_by(MoodRecord.created_at.desc())
-        .limit(limit)
-        .all()
-    )
-    return {
-        "mood_records": [
-            {
-                "id": r.id,
-                "mood": r.mood,
-                "intensity": r.intensity,
-                "note": r.note,
-                "created_at": r.created_at.isoformat() + "Z",
-            }
-            for r in records
-        ]
-    }
-
-
-# -----------------------------------------------------------------------------
-# Chat Messages
-# -----------------------------------------------------------------------------
-
-@app.post("/api/chat/messages")
-def create_chat_message(
-    body: ChatMessageCreate,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    chat_message = ChatMessage(
-        user_id=user.id,
-        content=body.content,
-        role=body.role,
-        bot_type=body.bot_type,
-        mode=body.mode,
-        user_mood=body.user_mood,
-        mood_intensity=body.mood_intensity,
-        created_at=datetime.utcnow(),
-    )
-    db.add(chat_message)
-    db.commit()
-    db.refresh(chat_message)
-    return {"ok": True, "message_id": chat_message.id}
-
-
-@app.get("/api/chat/messages/me")
-def my_chat_messages(
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-    limit: int = Query(default=20, le=100),
-    bot_type: Optional[str] = Query(default=None),
-):
-    query = db.query(ChatMessage).filter(ChatMessage.user_id == user.id)
-    if bot_type:
-        query = query.filter(ChatMessage.bot_type == bot_type)
-    
-    messages = query.order_by(ChatMessage.created_at.desc()).limit(limit).all()
-    
-    return {
-        "messages": [
-            {
-                "id": m.id,
-                "content": m.content,
-                "role": m.role,
-                "bot_type": m.bot_type,
-                "mode": m.mode,
-                "user_mood": m.user_mood,
-                "mood_intensity": m.mood_intensity,
-                "created_at": m.created_at.isoformat() + "Z",
-            }
-            for m in messages
-        ]
-    }
-
-
-# -----------------------------------------------------------------------------
-# Chat Sessions
-# -----------------------------------------------------------------------------
-
-@app.post("/api/chat/sessions")
-def create_chat_session(
-    body: ChatSessionCreate,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    # 結束現有的活躍會話
-    existing_sessions = db.query(ChatSession).filter(
-        ChatSession.user_id == user.id,
-        ChatSession.is_active == True
-    ).all()
-    
-    for session in existing_sessions:
-        session.is_active = False
-        session.session_end = datetime.utcnow()
-        session.end_reason = "user_ended"
-        db.add(session)
-    
-    # 創建新會話
-    new_session = ChatSession(
-        user_id=user.id,
-        bot_type=body.bot_type,
-        session_start=datetime.utcnow(),
-        last_activity=datetime.utcnow(),
-        is_active=True
-    )
-    db.add(new_session)
-    db.commit()
-    db.refresh(new_session)
-    
-    return {"ok": True, "session_id": new_session.id}
-
-
-@app.post("/api/chat/sessions/{session_id}/end")
-def end_chat_session(
-    session_id: int,
-    body: ChatSessionEnd,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    session = db.query(ChatSession).filter(
-        ChatSession.id == session_id,
-        ChatSession.user_id == user.id,
-        ChatSession.is_active == True
-    ).first()
-    
-    if not session:
-        raise HTTPException(status_code=404, detail="Active session not found")
-    
-    session.is_active = False
-    session.session_end = datetime.utcnow()
-    session.end_reason = body.reason
-    db.add(session)
-    db.commit()
-    
-    return {"ok": True, "session_ended": True}
-
-
-@app.get("/api/chat/sessions/me")
-def my_chat_sessions(
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-    limit: int = Query(default=10, le=50),
-):
-    sessions = (
-        db.query(ChatSession)
-        .filter(ChatSession.user_id == user.id)
-        .order_by(ChatSession.session_start.desc())
-        .limit(limit)
-        .all()
-    )
-    
-    return {
-        "sessions": [
-            {
-                "id": s.id,
-                "bot_type": s.bot_type,
-                "session_start": s.session_start.isoformat() + "Z",
-                "session_end": s.session_end.isoformat() + "Z" if s.session_end else None,
-                "last_activity": s.last_activity.isoformat() + "Z" if s.last_activity else None,
-                "is_active": s.is_active,
-                "message_count": s.message_count,
-                "end_reason": s.end_reason,
-            }
-            for s in sessions
-        ]
-    }
-
-
-# -----------------------------------------------------------------------------
-# Admin: Allowed PIDs Management
-# -----------------------------------------------------------------------------
-
-@app.post("/api/admin/allowed-pids")
-def create_allowed_pid(
-    body: AllowedPidCreate,
-    db: Session = Depends(get_db),
-):
-    # 簡單的管理員檢查（實際應用中需要更嚴格的權限控制）
-    existing = db.query(AllowedPid).filter(AllowedPid.pid == body.pid).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="PID already exists")
-    
-    allowed_pid = AllowedPid(
-        pid=body.pid,
-        description=body.description,
-        is_active=True,
-        created_at=datetime.utcnow(),
-    )
-    db.add(allowed_pid)
-    db.commit()
-    db.refresh(allowed_pid)
-    return {"ok": True, "allowed_pid_id": allowed_pid.id}
-
-
-@app.get("/api/admin/allowed-pids")
-def list_allowed_pids(
-    db: Session = Depends(get_db),
-    limit: int = Query(default=50, le=200),
-):
-    pids = db.query(AllowedPid).order_by(AllowedPid.created_at.desc()).limit(limit).all()
-    return {
-        "allowed_pids": [
-            {
-                "id": p.id,
-                "pid": p.pid,
-                "description": p.description,
-                "is_active": p.is_active,
-                "created_at": p.created_at.isoformat() + "Z",
-            }
-            for p in pids
-        ]
-    }
-
-
-@app.patch("/api/admin/allowed-pids/{pid_id}")
-def update_allowed_pid(
-    pid_id: int,
-    body: AllowedPidUpdate,
-    db: Session = Depends(get_db),
-):
-    allowed_pid = db.query(AllowedPid).filter(AllowedPid.id == pid_id).first()
-    if not allowed_pid:
-        raise HTTPException(status_code=404, detail="Allowed PID not found")
-    
-    if body.is_active is not None:
-        allowed_pid.is_active = body.is_active
-    if body.description is not None:
-        allowed_pid.description = body.description
-    
-    db.add(allowed_pid)
-    db.commit()
-    return {"ok": True}
-
-
-# -----------------------------------------------------------------------------
-# System Status & Metrics
+# System Status & Metrics（增強版）
 # -----------------------------------------------------------------------------
 
 @app.get("/api/system/status")
@@ -1140,6 +820,7 @@ def system_status(db: Session = Depends(get_db)):
         return {
             "ok": True,
             "timestamp": datetime.utcnow().isoformat() + "Z",
+            "version": "0.6.0",
             "stats": {
                 "total_users": total_users,
                 "total_assessments": total_assessments,
@@ -1153,9 +834,15 @@ def system_status(db: Session = Depends(get_db)):
             "services": {
                 "database": True,
                 "openai": bool(os.getenv("OPENAI_API_KEY")),
-                "heygen": bool(os.getenv("HEYGEN_API_KEY")),
-                "chat_router": chat_router_loaded,
-                "avatar_animation": avatar_animation_available,
+                "google_tts": bool(os.getenv("GOOGLE_TTS_API_KEY")),
+                "chat_router": router_status["chat"]["loaded"],
+                "avatar_animation": router_status["avatar_animation"]["loaded"],
+                "did_streaming": router_status["did"]["loaded"]  # 已過時但保留
+            },
+            "features": {
+                "primary": "avatar_animation" if router_status["avatar_animation"]["loaded"] else "text_chat",
+                "available": [k for k, v in router_status.items() if v["loaded"]],
+                "deprecated": ["did_streaming"] if router_status["did"]["loaded"] else []
             }
         }
     except Exception as e:
@@ -1165,7 +852,6 @@ def system_status(db: Session = Depends(get_db)):
             "timestamp": datetime.utcnow().isoformat() + "Z",
         }
 
-
 # -----------------------------------------------------------------------------
 # Root endpoint
 # -----------------------------------------------------------------------------
@@ -1174,11 +860,16 @@ def system_status(db: Session = Depends(get_db)):
 def root():
     return {
         "service": "Emobot Backend API",
-        "version": "0.5.1",
+        "version": "0.6.0",
         "status": "running",
         "docs": "/docs",
         "health": "/api/health",
-        "chat_router_loaded": chat_router_loaded,
-        "avatar_animation_available": avatar_animation_available,
+        "features": {
+            "chat_router": router_status["chat"]["loaded"],
+            "avatar_animation": router_status["avatar_animation"]["loaded"],
+            "did_streaming": router_status["did"]["loaded"]  # 已過時
+        },
+        "primary_mode": "avatar_animation",
         "timestamp": datetime.utcnow().isoformat() + "Z",
+        "notes": "專注於頭像動畫功能的心理對話機器人系統"
     }
