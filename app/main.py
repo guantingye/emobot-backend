@@ -1,4 +1,4 @@
-# app/main.py - 最終修復版，確保 HeyGen 路由正確註冊
+# app/main.py - 修復版，確保 HeyGen 路由正確註冊，並新增頭像動畫功能
 from __future__ import annotations
 
 import os
@@ -27,6 +27,15 @@ from app.models.mood import MoodRecord
 from app.models.allowed_pid import AllowedPid
 from app.models.chat_session import ChatSession
 from app.routers import did_router
+
+# ---- 新增：頭像動畫路由 ----
+try:
+    from app.routers import avatar_animation
+    avatar_animation_available = True
+    print("✅ 頭像動畫模組載入成功")
+except ImportError as e:
+    avatar_animation_available = False
+    print(f"⚠️ 頭像動畫模組載入失敗: {e}")
 
 # ---- Optional: 外部推薦引擎，失敗時走 fallback ----
 try:
@@ -89,9 +98,16 @@ def build_recommendation_payload(user: Dict[str, Any] | None, assessment: Dict[s
 # FastAPI App
 # -----------------------------------------------------------------------------
 
-app = FastAPI(title="Emobot Backend", version="0.5.0")
+app = FastAPI(title="Emobot Backend", version="0.5.1")
 
+# 註冊 DID router
 app.include_router(did_router.router)
+
+# 註冊頭像動畫路由
+if avatar_animation_available:
+    app.include_router(avatar_animation.router, prefix="/api/chat/avatar", tags=["avatar"])
+    print("✅ 頭像動畫路由註冊成功: /api/chat/avatar")
+
 # ---- CORS（官方 + 強化補丁）----
 ALLOWED = getattr(settings, "ALLOWED_ORIGINS", os.getenv(
     "ALLOWED_ORIGINS",
@@ -305,10 +321,10 @@ class ChatSessionEnd(BaseModel):
 def get_system_prompt(bot_type: str) -> str:
     """取得不同 AI 類型的系統提示"""
     prompts = {
-        "empathy": "你是 Lumi，同理型 AI。以溫柔、非評判、短句的反映傾聽與情緒標記來回應。優先肯認、共感與陪伴。用繁體中文回覆，保持溫暖支持的語調。",
-        "insight": "你是 Solin，洞察型 AI。以蘇格拉底式提問、澄清與重述，幫助使用者澄清想法，維持中性、尊重、結構化。用繁體中文回覆。",
-        "solution": "你是 Niko，解決型 AI。以務實、具體的建議與分步行動為主，給出小目標、工具與下一步，語氣鼓勵但不強迫。用繁體中文回覆。",
-        "cognitive": "你是 Clara，認知型 AI。以 CBT 語氣幫助辨識自動想法、認知偏誤與替代想法，提供簡短表格式步驟與練習。用繁體中文回覆。"
+        "empathy": "你是 Lumi，同理型 AI。以溫柔、非評判、短句的反映傾聽與情緒標記來回應。優先肯認、共感與陪伴。用繁體中文回復，保持溫暖支持的語調。",
+        "insight": "你是 Solin，洞察型 AI。以蘇格拉底式提問、澄清與重述，幫助使用者澄清想法，維持中性、尊重、結構化。用繁體中文回復。",
+        "solution": "你是 Niko，解決型 AI。以務實、具體的建議與分步行動為主，給出小目標、工具與下一步，語氣鼓勵但不強迫。用繁體中文回復。",
+        "cognitive": "你是 Clara，認知型 AI。以 CBT 語氣幫助辨識自動想法、認知偏誤與替代想法，提供簡短表格式步驟與練習。用繁體中文回復。"
     }
     return prompts.get(bot_type, prompts["solution"])
 
@@ -348,7 +364,7 @@ def call_openai(system_prompt: str, messages: List[Dict[str, str]]) -> str:
         
     except Exception as e:
         print(f"OpenAI API failed: {e}")
-        # 返回預設回覆而不是拋出異常
+        # 返回預設回復而不是拋出異常
         return "我在這裡陪著你。想聊聊今天最讓你在意的事情嗎？"
 
 
@@ -440,6 +456,7 @@ def health():
         "time": datetime.utcnow().isoformat() + "Z",
         "chat_router_loaded": chat_router_loaded,
         "chat_router_error": chat_router_error,
+        "avatar_animation_available": avatar_animation_available,
         "heygen_enabled": bool(os.getenv("HEYGEN_API_KEY")),
         "routes_count": len(app.routes)
     }
@@ -471,9 +488,13 @@ def list_all_routes():
         "routes": routes,
         "chat_routes": [r for r in routes if '/chat/' in r['path']],
         "heygen_routes": [r for r in routes if 'heygen' in r['path']],
+        "avatar_routes": [r for r in routes if 'avatar' in r['path']],
         "chat_router_status": {
             "loaded": chat_router_loaded,
             "error": chat_router_error
+        },
+        "avatar_animation_status": {
+            "available": avatar_animation_available
         }
     }
 
@@ -786,7 +807,7 @@ def chat_send(
         # 3. 呼叫 OpenAI
         reply_text = call_openai(system_prompt, messages)
         
-        # 4. 儲存 AI 回覆
+        # 4. 儲存 AI 回復
         ai_message = ChatMessage(
             user_id=user_id,
             bot_type=bot_type,
@@ -802,7 +823,7 @@ def chat_send(
         db.add(ai_message)
         db.commit()
         
-        # 再次更新會話活動（AI 回覆也算活動）
+        # 再次更新會話活動（AI 回復也算活動）
         update_session_activity(user_id, db)
         
         # 5. 返回結果（修復：確保包含 ok 欄位）
@@ -1134,6 +1155,7 @@ def system_status(db: Session = Depends(get_db)):
                 "openai": bool(os.getenv("OPENAI_API_KEY")),
                 "heygen": bool(os.getenv("HEYGEN_API_KEY")),
                 "chat_router": chat_router_loaded,
+                "avatar_animation": avatar_animation_available,
             }
         }
     except Exception as e:
@@ -1152,10 +1174,11 @@ def system_status(db: Session = Depends(get_db)):
 def root():
     return {
         "service": "Emobot Backend API",
-        "version": "0.5.0",
+        "version": "0.5.1",
         "status": "running",
         "docs": "/docs",
         "health": "/api/health",
         "chat_router_loaded": chat_router_loaded,
+        "avatar_animation_available": avatar_animation_available,
         "timestamp": datetime.utcnow().isoformat() + "Z",
     }
