@@ -1,10 +1,10 @@
-# app/routers/avatar_animation.py - 完整修復版（OpenAI優先 + Edge/Google備援，修正 coroutine 問題）
+# app/routers/avatar_animation.py - 強化版（OpenAI優先 + HTTP備援 + 詳細診斷）
 import os
 import asyncio
 import base64
 import tempfile
 import re
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, Tuple
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, BackgroundTasks
@@ -32,54 +32,14 @@ class AvatarAnimationResponse(BaseModel):
 # ================= 動畫風格配置 =================
 
 ANIMATION_STYLES = {
-    "empathy": {
-        "name": "Lumi",
-        "voice": "alloy",                  # OpenAI voice（主用）
-        "edge_voice": "zh-TW-HsiaoChenNeural",  # Edge 備援
-        "rate": "0.9",
-        "style": {
-            "mouth_intensity": 0.8,
-            "blink_frequency": 0.7,
-            "head_movement": 0.6,
-            "emotion": "gentle"
-        }
-    },
-    "insight": {
-        "name": "Solin",
-        "voice": "alloy",
-        "edge_voice": "zh-TW-YunJheNeural",
-        "rate": "0.95",
-        "style": {
-            "mouth_intensity": 0.7,
-            "blink_frequency": 0.5,
-            "head_movement": 0.4,
-            "emotion": "thoughtful"
-        }
-    },
-    "solution": {
-        "name": "Niko",
-        "voice": "alloy",
-        "edge_voice": "zh-TW-HsiaoChenNeural",
-        "rate": "1.0",
-        "style": {
-            "mouth_intensity": 0.9,
-            "blink_frequency": 0.6,
-            "head_movement": 0.8,
-            "emotion": "confident"
-        }
-    },
-    "cognitive": {
-        "name": "Clara",
-        "voice": "alloy",
-        "edge_voice": "zh-TW-YunJheNeural",
-        "rate": "1.05",
-        "style": {
-            "mouth_intensity": 0.6,
-            "blink_frequency": 0.4,
-            "head_movement": 0.3,
-            "emotion": "calm"
-        }
-    }
+    "empathy":  {"name": "Lumi",   "voice": "alloy", "edge_voice": "zh-TW-HsiaoChenNeural", "rate": "0.9",
+                 "style": {"mouth_intensity": 0.8, "blink_frequency": 0.7, "head_movement": 0.6, "emotion": "gentle"}},
+    "insight":  {"name": "Solin",  "voice": "alloy", "edge_voice": "zh-TW-YunJheNeural",    "rate": "0.95",
+                 "style": {"mouth_intensity": 0.7, "blink_frequency": 0.5, "head_movement": 0.4, "emotion": "thoughtful"}},
+    "solution": {"name": "Niko",   "voice": "alloy", "edge_voice": "zh-TW-HsiaoChenNeural", "rate": "1.0",
+                 "style": {"mouth_intensity": 0.9, "blink_frequency": 0.6, "head_movement": 0.8, "emotion": "confident"}},
+    "cognitive":{"name": "Clara",  "voice": "alloy", "edge_voice": "zh-TW-YunJheNeural",    "rate": "1.05",
+                 "style": {"mouth_intensity": 0.6, "blink_frequency": 0.4, "head_movement": 0.3, "emotion": "calm"}},
 }
 
 # ================== 小工具 ==================
@@ -93,29 +53,33 @@ def _env_bool(name: str, default: bool = False) -> bool:
 def _safe_b64(data: bytes, mime: str = "audio/mp3") -> str:
     return f"data:{mime};base64,{base64.b64encode(data).decode('utf-8')}"
 
-# ================== OpenAI TTS（主用） ==================
+# ================== OpenAI TTS（主用，雙路徑） ==================
 
-async def _openai_tts_bytes(text: str, voice: str = "alloy", fmt: str = "mp3") -> Optional[bytes]:
+async def _openai_tts_bytes(text: str, voice: str = "alloy", fmt: str = "mp3") -> Tuple[Optional[bytes], Optional[str]]:
     """
-    以 OpenAI TTS 產生音訊（bytes）。失敗回 None。
-    修正點：使用同步函式 + streaming_response.stream_to_file，避免回傳 coroutine。
+    以 OpenAI TTS 產生音訊（bytes）。失敗回 (None, error_msg)。
+    1) 嘗試 SDK streaming_response
+    2) 失敗則用 aiohttp 直呼 REST API（/v1/audio/speech）
     """
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
-        return None
+        return None, "OPENAI_API_KEY not set"
 
     model = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts").strip() or "gpt-4o-mini-tts"
     fmt = (fmt or os.getenv("OPENAI_TTS_FORMAT", "mp3")).lower()
     if fmt not in ("mp3", "wav", "pcm"):
         fmt = "mp3"
     voice = voice or os.getenv("OPENAI_TTS_VOICE", "alloy")
+    base_url = os.getenv("OPENAI_API_BASE", "https://api.openai.com").rstrip("/")
 
-    def _do() -> Optional[bytes]:
+    last_err = None
+
+    # 1) 官方 SDK with_streaming_response
+    def _do_sdk() -> Tuple[Optional[bytes], Optional[str]]:
         try:
             from openai import OpenAI
-            client = OpenAI(api_key=api_key)
+            client = OpenAI(api_key=api_key, base_url=base_url)
 
-            # 用 streaming_response 寫到檔案，再讀 bytes，兼容不同 SDK 版本
             with tempfile.NamedTemporaryFile(suffix=f".{fmt}", delete=False) as tmp:
                 tmp_path = tmp.name
 
@@ -130,8 +94,8 @@ async def _openai_tts_bytes(text: str, voice: str = "alloy", fmt: str = "mp3") -
 
                 if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 1024:
                     with open(tmp_path, "rb") as f:
-                        return f.read()
-                return None
+                        return f.read(), None
+                return None, "OpenAI SDK produced empty/too-small file"
             finally:
                 try:
                     os.unlink(tmp_path)
@@ -139,27 +103,46 @@ async def _openai_tts_bytes(text: str, voice: str = "alloy", fmt: str = "mp3") -
                     pass
 
         except Exception as e:
-            logger.warning(f"[OpenAI TTS] Exception: {e}")
-            return None
+            return None, f"OpenAI SDK error: {e}"
 
-    # 在 thread 中執行同步 I/O
-    return await asyncio.to_thread(_do)
+    data, err = await asyncio.to_thread(_do_sdk)
+    if data:
+        return data, None
+    last_err = err
+
+    # 2) 直接 HTTP（aiohttp）
+    try:
+        import aiohttp
+        url = f"{base_url}/v1/audio/speech"
+        payload = {"model": model, "voice": voice, "input": text, "format": fmt}
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        timeout = aiohttp.ClientTimeout(total=60)
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, json=payload, headers=headers) as resp:
+                if resp.status == 200:
+                    bin_data = await resp.read()
+                    if bin_data and len(bin_data) > 1024:
+                        return bin_data, None
+                    return None, "OpenAI HTTP returned too small/empty body"
+                else:
+                    body = await resp.text()
+                    return None, f"OpenAI HTTP {resp.status}: {body[:200]}"
+    except Exception as e:
+        last_err = f"OpenAI HTTP error: {e}"
+
+    return None, last_err or "OpenAI TTS failed"
 
 # ================== Edge TTS（可選備援） ==================
 
-async def _edge_tts_bytes(text: str, voice: str, rate: str) -> Optional[bytes]:
-    """
-    使用 edge-tts 產生 MP3。Render/雲端常見 403，此為備援。
-    """
+async def _edge_tts_bytes(text: str, voice: str, rate: str) -> Tuple[Optional[bytes], Optional[str]]:
     if not _env_bool("EDGE_TTS_ENABLED", False):
-        return None
+        return None, "EDGE_TTS not enabled"
     try:
         import edge_tts  # type: ignore
     except Exception:
-        logger.info("edge-tts 未安裝或不可用")
-        return None
+        return None, "edge-tts not installed"
 
-    # 將 rate(0.9~1.1等)轉為 +N% 並限制範圍
     try:
         pct = int((float(rate) - 1.0) * 100)
     except Exception:
@@ -167,6 +150,7 @@ async def _edge_tts_bytes(text: str, voice: str, rate: str) -> Optional[bytes]:
     pct = max(-50, min(50, pct))
     rate_str = f"+{pct}%"
 
+    last_err = None
     for attempt in range(3):
         try:
             communicate = edge_tts.Communicate(text, voice, rate=rate_str)
@@ -177,9 +161,8 @@ async def _edge_tts_bytes(text: str, voice: str, rate: str) -> Optional[bytes]:
                 await asyncio.wait_for(communicate.save(tmp_path), timeout=30)
                 if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 1024:
                     with open(tmp_path, "rb") as f:
-                        return f.read()
-                else:
-                    logger.warning(f"Edge-TTS 產出檔案太小或不存在 (attempt={attempt+1})")
+                        return f.read(), None
+                last_err = "Edge produced empty/too-small file"
             finally:
                 try:
                     os.unlink(tmp_path)
@@ -187,37 +170,29 @@ async def _edge_tts_bytes(text: str, voice: str, rate: str) -> Optional[bytes]:
                     pass
 
         except asyncio.TimeoutError:
-            logger.warning(f"Edge-TTS 超時 (attempt={attempt+1})")
+            last_err = "Edge timeout (rate limit or network)"
         except Exception as e:
             emsg = str(e)
             if "403" in emsg or "Invalid response status" in emsg:
-                logger.warning(f"Edge-TTS 403/RL (attempt={attempt+1}): {emsg}")
+                last_err = f"Edge 403/RL: {emsg}"
             else:
-                logger.warning(f"Edge-TTS 錯誤 (attempt={attempt+1}): {emsg}")
-
+                last_err = f"Edge error: {emsg}"
         await asyncio.sleep(1)
 
-    return None
+    return None, last_err or "Edge TTS failed"
 
 # ================== Google TTS（可選備援） ==================
 
-async def _google_tts_b64(text: str, voice_hint: str) -> Optional[str]:
-    """
-    使用 Google Cloud TTS 回傳 base64（API 直接回傳base64）。
-    """
+async def _google_tts_b64(text: str, voice_hint: str) -> Tuple[Optional[str], Optional[str]]:
     google_api_key = os.getenv("GOOGLE_TTS_API_KEY", "").strip()
     if not google_api_key:
-        return None
+        return None, "GOOGLE_TTS_API_KEY not set"
     try:
         import aiohttp
     except Exception:
-        logger.info("aiohttp 未安裝，略過 Google TTS")
-        return None
+        return None, "aiohttp not installed"
 
-    voice_map = {
-        "zh-TW-HsiaoChenNeural": "zh-TW-Wavenet-A",
-        "zh-TW-YunJheNeural": "zh-TW-Wavenet-B",
-    }
+    voice_map = {"zh-TW-HsiaoChenNeural": "zh-TW-Wavenet-A", "zh-TW-YunJheNeural": "zh-TW-Wavenet-B"}
     google_voice = voice_map.get(voice_hint, "zh-TW-Wavenet-A")
 
     url = f"https://texttospeech.googleapis.com/v1/text:synthesize?key={google_api_key}"
@@ -228,124 +203,104 @@ async def _google_tts_b64(text: str, voice_hint: str) -> Optional[str]:
     }
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, timeout=30) as resp:
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, json=payload) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return data.get("audioContent")
+                    b64 = data.get("audioContent")
+                    if b64:
+                        return b64, None
+                    return None, "Google returned empty audioContent"
                 else:
-                    logger.warning(f"Google TTS 狀態碼: {resp.status}")
+                    body = await resp.text()
+                    return None, f"Google HTTP {resp.status}: {body[:200]}"
     except Exception as e:
-        logger.warning(f"Google TTS 失敗: {e}")
-    return None
+        return None, f"Google error: {e}"
 
 # ================= 語音合成與動畫生成 =================
 
 async def generate_speech_and_animation(text: str, bot_type: str) -> Dict[str, Any]:
     """
     生成語音與動畫：
-      1) OpenAI TTS（首選）
-      2) Edge-TTS（可選，EDGE_TTS_ENABLED=1）
-      3) Google TTS（需 GOOGLE_TTS_API_KEY）
+      1) OpenAI TTS（首選：SDK → HTTP）
+      2) Edge-TTS（可選）
+      3) Google TTS（可選）
     """
-    clean_text = re.sub(r'[^\w\s\u4e00-\u9fff，。！？、：；「」『』（）]', '', text)  # 保留中英數與常用標點
+    debug = _env_bool("DEBUG_TTS", False)
+
+    clean_text = re.sub(r'[^\w\s\u4e00-\u9fff，。！？、：；「」『』（）]', '', text)
     if not clean_text.strip():
         clean_text = "很高興和你聊天"
 
-    style_conf = ANIMATION_STYLES.get(bot_type, ANIMATION_STYLES["solution"])
-    openai_voice = style_conf.get("voice", "alloy")
-    edge_voice = style_conf.get("edge_voice", "zh-TW-HsiaoChenNeural")
-    rate = style_conf.get("rate", "1.0")
-    anim_style = style_conf["style"]
+    conf = ANIMATION_STYLES.get(bot_type, ANIMATION_STYLES["solution"])
+    openai_voice = conf.get("voice", "alloy")
+    edge_voice = conf.get("edge_voice", "zh-TW-HsiaoChenNeural")
+    rate = conf.get("rate", "1.0")
+    anim_style = conf["style"]
 
-    # 先做動畫（無論語音是否成功）
     animation_data = generate_animation_timeline(clean_text, anim_style)
 
-    # 1) OpenAI TTS
-    audio_bytes = await _openai_tts_bytes(clean_text, voice=openai_voice, fmt=os.getenv("OPENAI_TTS_FORMAT", "mp3"))
+    # 1) OpenAI
+    audio_bytes, err = await _openai_tts_bytes(clean_text, voice=openai_voice, fmt=os.getenv("OPENAI_TTS_FORMAT", "mp3"))
     if audio_bytes:
         animation_data.setdefault("meta", {})["provider"] = "openai"
-        return {
-            "success": True,
-            "audio_base64": _safe_b64(audio_bytes, mime="audio/mp3"),
-            "animation_data": animation_data,
-            "duration": animation_data.get("total_duration", 3.0),
-            "error": None
-        }
+        return {"success": True, "audio_base64": _safe_b64(audio_bytes, "audio/mp3"),
+                "animation_data": animation_data, "duration": animation_data.get("total_duration", 3.0), "error": None}
 
-    # 2) Edge-TTS（可選）
-    edge_bytes = await _edge_tts_bytes(clean_text, voice=edge_voice, rate=rate)
+    last_error = f"OpenAI failed: {err}" if err else "OpenAI failed"
+
+    # 2) Edge
+    edge_bytes, edge_err = await _edge_tts_bytes(clean_text, voice=edge_voice, rate=rate)
     if edge_bytes:
         animation_data.setdefault("meta", {})["provider"] = "edge-tts"
-        return {
-            "success": True,
-            "audio_base64": _safe_b64(edge_bytes, mime="audio/mp3"),
-            "animation_data": animation_data,
-            "duration": animation_data.get("total_duration", 3.0),
-            "error": None
-        }
+        return {"success": True, "audio_base64": _safe_b64(edge_bytes, "audio/mp3"),
+                "animation_data": animation_data, "duration": animation_data.get("total_duration", 3.0), "error": None}
+    if edge_err:
+        last_error += f" | {edge_err}"
 
-    # 3) Google TTS（可選）
-    google_b64 = await _google_tts_b64(clean_text, voice_hint=edge_voice)
+    # 3) Google
+    google_b64, g_err = await _google_tts_b64(clean_text, voice_hint=edge_voice)
     if google_b64:
         animation_data.setdefault("meta", {})["provider"] = "google-tts"
-        return {
-            "success": True,
-            "audio_base64": f"data:audio/mp3;base64,{google_b64}",
-            "animation_data": animation_data,
-            "duration": animation_data.get("total_duration", 3.0),
-            "error": None
-        }
+        return {"success": True, "audio_base64": f"data:audio/mp3;base64,{google_b64}",
+                "animation_data": animation_data, "duration": animation_data.get("total_duration", 3.0), "error": None}
+    if g_err:
+        last_error += f" | {g_err}"
 
-    # 全部失敗：靜默模式
+    # 全部失敗
     animation_data.setdefault("meta", {})["provider"] = "none"
-    return {
-        "success": False,
-        "audio_base64": None,
-        "animation_data": animation_data,
-        "duration": animation_data.get("total_duration", 3.0),
-        "error": "All TTS providers failed (OpenAI/Edge/Google)."
-    }
+    public_err = "All TTS providers failed (OpenAI/Edge/Google)."
+    if debug and last_error:
+        public_err += f" detail: {last_error}"
+    return {"success": False, "audio_base64": None, "animation_data": animation_data,
+            "duration": animation_data.get("total_duration", 3.0), "error": public_err}
 
-# 舊函式名（供 /api/debug/avatar-test 調用）；如 main.py 引用舊名，可保留
+# 舊名相容（main.py 的 debug 端點可能調用）
 async def generate_speech_and_animation_old(text: str, bot_type: str) -> Dict[str, Any]:
     return await generate_speech_and_animation(text, bot_type)
 
 # ================= API 端點 =================
 
 @router.post("/animate", response_model=AvatarAnimationResponse)
-async def create_avatar_animation(
-    request: AvatarAnimationRequest,
-    background_tasks: BackgroundTasks
-):
-    """
-    生成頭像語音 + 動畫（與前端既有協定相容）
-    """
+async def create_avatar_animation(request: AvatarAnimationRequest, background_tasks: BackgroundTasks):
     if not request.text or not request.text.strip():
         raise HTTPException(status_code=400, detail="文字內容不能為空")
 
-    # 限制文字長度（保守限 500）
     text = request.text.strip()
     if len(text) > 500:
         text = text[:500] + "..."
 
     try:
         result = await generate_speech_and_animation(text, request.bot_type)
-        return AvatarAnimationResponse(
-            success=result["success"],
-            audio_base64=result.get("audio_base64"),
-            animation_data=result.get("animation_data"),
-            duration=result.get("duration"),
-            error=result.get("error")
-        )
+        return AvatarAnimationResponse(**result)
     except Exception as e:
         logger.error(f"動畫生成失敗: {e}")
         try:
-            style_conf = ANIMATION_STYLES.get(request.bot_type, ANIMATION_STYLES["solution"])
-            fallback_animation = generate_fallback_animation(text, style_conf["style"])
+            conf = ANIMATION_STYLES.get(request.bot_type, ANIMATION_STYLES["solution"])
+            fallback_animation = generate_fallback_animation(text, conf["style"])
             return AvatarAnimationResponse(
-                success=False,
-                audio_base64=None,
+                success=False, audio_base64=None,
                 animation_data=fallback_animation,
                 duration=fallback_animation.get("total_duration", 3.0),
                 error=f"動畫生成失敗，使用靜默模式: {str(e)}"
@@ -357,80 +312,61 @@ async def create_avatar_animation(
 @router.get("/health")
 async def health_check():
     """
-    動畫/TTS 提供者健康檢查
-      - openai: 僅檢查環境變數是否存在（避免產生成本）
-      - edge-tts: 檢查套件 & EDGE_TTS_ENABLED
-      - google-tts: 輕量連線測試（需要 GOOGLE_TTS_API_KEY）
+    提供者健康檢查：
+      - openai: 環境變數 + base_url ping
+      - edge-tts: 是否啟用/安裝
+      - google-tts: voices 探測（若有 key）
     """
-    info: Dict[str, Any] = {
-        "status": "unknown",
-        "providers": {},
-        "supported_bots": list(ANIMATION_STYLES.keys()),
-        "test_completed": True
-    }
+    info: Dict[str, Any] = {"status": "unknown", "providers": {}, "supported_bots": list(ANIMATION_STYLES.keys())}
+    base_url = os.getenv("OPENAI_API_BASE", "https://api.openai.com").rstrip("/")
 
     # OpenAI
     openai_ok = bool(os.getenv("OPENAI_API_KEY"))
-    info["providers"]["openai"] = {"available": openai_ok, "error": None if openai_ok else "OPENAI_API_KEY not set"}
+    ping_ok = False
+    ping_err = None
+    if openai_ok:
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6)) as s:
+                async with s.get(base_url, headers={"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"}) as r:
+                    ping_ok = (200 <= r.status < 500)  # 2xx/3xx/4xx 都代表 DNS/TLS/路由可達
+        except Exception as e:
+            ping_err = str(e)
+    info["providers"]["openai"] = {"env": openai_ok, "ping": ping_ok, "base": base_url, "error": ping_err}
 
     # Edge
     try:
         import edge_tts  # type: ignore
         edge_enabled = _env_bool("EDGE_TTS_ENABLED", False)
-        info["providers"]["edge_tts"] = {
-            "available": edge_enabled,
-            "error": None if edge_enabled else "EDGE_TTS_ENABLED=1 以啟用（雲端可能403）"
-        }
+        info["providers"]["edge_tts"] = {"enabled": edge_enabled, "installed": True}
     except Exception:
-        info["providers"]["edge_tts"] = {"available": False, "error": "edge-tts not installed"}
+        info["providers"]["edge_tts"] = {"enabled": _env_bool("EDGE_TTS_ENABLED", False), "installed": False}
 
     # Google
     google_key = os.getenv("GOOGLE_TTS_API_KEY")
     if google_key:
         try:
-            import aiohttp  # type: ignore
+            import aiohttp
             url = f"https://texttospeech.googleapis.com/v1/voices?key={google_key}"
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=10) as resp:
-                    info["providers"]["google_tts"] = {
-                        "available": resp.status == 200,
-                        "status_code": resp.status,
-                        "error": None if resp.status == 200 else f"status={resp.status}"
-                    }
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
+                async with session.get(url) as resp:
+                    info["providers"]["google_tts"] = {"key": True, "http": resp.status}
         except Exception as e:
-            info["providers"]["google_tts"] = {"available": False, "error": str(e)}
+            info["providers"]["google_tts"] = {"key": True, "http": None, "error": str(e)}
     else:
-        info["providers"]["google_tts"] = {"available": False, "error": "GOOGLE_TTS_API_KEY not set"}
+        info["providers"]["google_tts"] = {"key": False}
 
-    # 總結
-    if any(p.get("available") for p in info["providers"].values()):
-        info["status"] = "healthy"
-    else:
-        info["status"] = "error"
-
+    info["status"] = "healthy" if (info["providers"]["openai"]["env"] and (info["providers"]["openai"]["ping"])) else "degraded"
     return info
 
 @router.get("/styles")
 async def get_animation_styles():
-    """獲取可用的動畫風格"""
-    return {
-        "styles": ANIMATION_STYLES,
-        "available_bots": list(ANIMATION_STYLES.keys()),
-        "description": "頭像動畫風格配置，包含語音與動作參數"
-    }
+    return {"styles": ANIMATION_STYLES, "available_bots": list(ANIMATION_STYLES.keys()),
+            "description": "頭像動畫風格配置，包含語音與動作參數"}
 
 @router.post("/preload")
 async def preload_common_phrases(background_tasks: BackgroundTasks):
-    """
-    預載常用短語（背景任務）
-    """
-    common_phrases = [
-        "你好，我是你的AI夥伴",
-        "今天想聊什麼呢？",
-        "我在這裡陪著你",
-        "讓我們一起思考一下",
-        "謝謝你和我分享"
-    ]
+    common_phrases = ["你好，我是你的AI夥伴", "今天想聊什麼呢？", "我在這裡陪著你", "讓我們一起思考一下", "謝謝你和我分享"]
     for bot_type in ANIMATION_STYLES.keys():
         for phrase in common_phrases:
             background_tasks.add_task(preload_phrase, phrase, bot_type)
@@ -445,9 +381,6 @@ async def preload_phrase(text: str, bot_type: str):
 
 @router.get("/test")
 async def test_animation_generation():
-    """
-    輕量自測：每個 bot 走一遍流程（注意：若開啟 OpenAI 會產生成本）
-    """
     test_text = "這是一個測試語句，用來檢查動畫生成系統是否正常運作。"
     results: Dict[str, Any] = {}
     for bot_type in ANIMATION_STYLES.keys():
@@ -469,12 +402,9 @@ async def test_animation_generation():
 # ================= 動畫生成 =================
 
 def generate_animation_timeline(text: str, style: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    根據文字生成嘴型、眨眼與頭部微動時間軸（與前端相容）
-    """
     chars = len(text)
     words = len(text.split())
-    base_duration = max(2.0, min(12.0, chars * 0.12))  # 上限12s避免過長
+    base_duration = max(2.0, min(12.0, chars * 0.12))  # 上限12s
 
     mouth_intensity = style.get("mouth_intensity", 0.8)
     blink_frequency = style.get("blink_frequency", 0.6)
@@ -494,7 +424,6 @@ def generate_animation_timeline(text: str, style: Dict[str, Any]) -> Dict[str, A
         if t > base_duration:
             break
 
-    # 眨眼
     timeline_blink = []
     if blink_frequency > 0:
         interval = max(1.6, 2.4 / blink_frequency)
@@ -508,7 +437,6 @@ def generate_animation_timeline(text: str, style: Dict[str, Any]) -> Dict[str, A
             ])
             bt += interval
 
-    # 頭部微動
     timeline_head = []
     if head_movement > 0.2:
         ht = 0.0
@@ -525,16 +453,10 @@ def generate_animation_timeline(text: str, style: Dict[str, Any]) -> Dict[str, A
         "head_animation": timeline_head,
         "style_config": {"emotion": emotion, "intensity": mouth_intensity},
         "meta": {"provider": "pending"},
-        "metadata": {
-            "text_length": chars,
-            "word_count": words,
-            "generated_at": datetime.utcnow().isoformat(),
-            "tts_attempted": True
-        }
+        "metadata": {"text_length": chars, "word_count": words, "generated_at": datetime.utcnow().isoformat(), "tts_attempted": True}
     }
 
 def generate_fallback_animation(text: str, style: Dict[str, Any]) -> Dict[str, Any]:
-    """語音失敗時的靜默動畫"""
     chars = len(text)
     duration = max(3.0, min(10.0, chars * 0.15))
     return {
