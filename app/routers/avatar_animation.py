@@ -1,11 +1,10 @@
-# app/routers/avatar_animation.py - 完整修復版（OpenAI優先 + Edge/Google備援）
+# app/routers/avatar_animation.py - 完整修復版（OpenAI優先 + Edge/Google備援，修正 coroutine 問題）
 import os
 import asyncio
 import base64
 import tempfile
-import json
 import re
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, BackgroundTasks
@@ -35,8 +34,8 @@ class AvatarAnimationResponse(BaseModel):
 ANIMATION_STYLES = {
     "empathy": {
         "name": "Lumi",
-        "voice": "alloy",  # OpenAI voice (primary)
-        "edge_voice": "zh-TW-HsiaoChenNeural",
+        "voice": "alloy",                  # OpenAI voice（主用）
+        "edge_voice": "zh-TW-HsiaoChenNeural",  # Edge 備援
         "rate": "0.9",
         "style": {
             "mouth_intensity": 0.8,
@@ -83,7 +82,7 @@ ANIMATION_STYLES = {
     }
 }
 
-# ================== Provider Helpers ==================
+# ================== 小工具 ==================
 
 def _env_bool(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
@@ -94,57 +93,59 @@ def _env_bool(name: str, default: bool = False) -> bool:
 def _safe_b64(data: bytes, mime: str = "audio/mp3") -> str:
     return f"data:{mime};base64,{base64.b64encode(data).decode('utf-8')}"
 
-# ------------------ OpenAI TTS (primary) ------------------
+# ================== OpenAI TTS（主用） ==================
 
 async def _openai_tts_bytes(text: str, voice: str = "alloy", fmt: str = "mp3") -> Optional[bytes]:
     """
     以 OpenAI TTS 產生音訊（bytes）。失敗回 None。
+    修正點：使用同步函式 + streaming_response.stream_to_file，避免回傳 coroutine。
     """
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         return None
 
-    # 允許透過環境變數覆寫
     model = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts").strip() or "gpt-4o-mini-tts"
     fmt = (fmt or os.getenv("OPENAI_TTS_FORMAT", "mp3")).lower()
     if fmt not in ("mp3", "wav", "pcm"):
         fmt = "mp3"
     voice = voice or os.getenv("OPENAI_TTS_VOICE", "alloy")
 
-    # OpenAI 官方 SDK 為同步；用 thread 以免阻塞事件迴圈
-    async def _do() -> Optional[bytes]:
+    def _do() -> Optional[bytes]:
         try:
             from openai import OpenAI
             client = OpenAI(api_key=api_key)
-            resp = client.audio.speech.create(
-                model=model,
-                voice=voice,
-                input=text,
-                format=fmt,
-            )
-            # 嘗試從多種欄位取 bytes（不同 SDK 版可能差異）
-            if hasattr(resp, "read"):
-                return resp.read()
-            content = getattr(resp, "content", None)
-            if isinstance(content, (bytes, bytearray)):
-                return bytes(content)
 
-            # 迭代 chunk
-            chunks = []
-            for ch in resp:
-                if isinstance(ch, (bytes, bytearray)):
-                    chunks.append(bytes(ch))
-                elif hasattr(ch, "data"):
-                    chunks.append(ch.data)
-            if chunks:
-                return b"".join(chunks)
+            # 用 streaming_response 寫到檔案，再讀 bytes，兼容不同 SDK 版本
+            with tempfile.NamedTemporaryFile(suffix=f".{fmt}", delete=False) as tmp:
+                tmp_path = tmp.name
+
+            try:
+                with client.audio.speech.with_streaming_response.create(
+                    model=model,
+                    voice=voice,
+                    input=text,
+                    format=fmt,
+                ) as resp:
+                    resp.stream_to_file(tmp_path)
+
+                if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 1024:
+                    with open(tmp_path, "rb") as f:
+                        return f.read()
+                return None
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+
         except Exception as e:
             logger.warning(f"[OpenAI TTS] Exception: {e}")
-        return None
+            return None
 
+    # 在 thread 中執行同步 I/O
     return await asyncio.to_thread(_do)
 
-# ------------------ Edge TTS (optional fallback) ------------------
+# ================== Edge TTS（可選備援） ==================
 
 async def _edge_tts_bytes(text: str, voice: str, rate: str) -> Optional[bytes]:
     """
@@ -166,7 +167,6 @@ async def _edge_tts_bytes(text: str, voice: str, rate: str) -> Optional[bytes]:
     pct = max(-50, min(50, pct))
     rate_str = f"+{pct}%"
 
-    # 重試 3 次，處理 403/網路問題
     for attempt in range(3):
         try:
             communicate = edge_tts.Communicate(text, voice, rate=rate_str)
@@ -189,7 +189,6 @@ async def _edge_tts_bytes(text: str, voice: str, rate: str) -> Optional[bytes]:
         except asyncio.TimeoutError:
             logger.warning(f"Edge-TTS 超時 (attempt={attempt+1})")
         except Exception as e:
-            # 常見：403 Invalid response status
             emsg = str(e)
             if "403" in emsg or "Invalid response status" in emsg:
                 logger.warning(f"Edge-TTS 403/RL (attempt={attempt+1}): {emsg}")
@@ -200,7 +199,7 @@ async def _edge_tts_bytes(text: str, voice: str, rate: str) -> Optional[bytes]:
 
     return None
 
-# ------------------ Google TTS (optional fallback) ------------------
+# ================== Google TTS（可選備援） ==================
 
 async def _google_tts_b64(text: str, voice_hint: str) -> Optional[str]:
     """
@@ -215,7 +214,6 @@ async def _google_tts_b64(text: str, voice_hint: str) -> Optional[str]:
         logger.info("aiohttp 未安裝，略過 Google TTS")
         return None
 
-    # Edge voice -> Google voice 粗略映射
     voice_map = {
         "zh-TW-HsiaoChenNeural": "zh-TW-Wavenet-A",
         "zh-TW-YunJheNeural": "zh-TW-Wavenet-B",
@@ -255,7 +253,6 @@ async def generate_speech_and_animation(text: str, bot_type: str) -> Dict[str, A
         clean_text = "很高興和你聊天"
 
     style_conf = ANIMATION_STYLES.get(bot_type, ANIMATION_STYLES["solution"])
-    # OpenAI voice 優先（可由請求覆寫），Edge voice 僅作備援時使用
     openai_voice = style_conf.get("voice", "alloy")
     edge_voice = style_conf.get("edge_voice", "zh-TW-HsiaoChenNeural")
     rate = style_conf.get("rate", "1.0")
@@ -310,8 +307,7 @@ async def generate_speech_and_animation(text: str, bot_type: str) -> Dict[str, A
         "error": "All TTS providers failed (OpenAI/Edge/Google)."
     }
 
-# 舊函式名（供 /api/debug/avatar-test 調用）
-# 注意：main.py 會從這裡 import
+# 舊函式名（供 /api/debug/avatar-test 調用）；如 main.py 引用舊名，可保留
 async def generate_speech_and_animation_old(text: str, bot_type: str) -> Dict[str, Any]:
     return await generate_speech_and_animation(text, bot_type)
 
@@ -364,7 +360,7 @@ async def health_check():
     動畫/TTS 提供者健康檢查
       - openai: 僅檢查環境變數是否存在（避免產生成本）
       - edge-tts: 檢查套件 & EDGE_TTS_ENABLED
-      - google-tts: 嘗試列出 voices（需要 GOOGLE_TTS_API_KEY）
+      - google-tts: 輕量連線測試（需要 GOOGLE_TTS_API_KEY）
     """
     info: Dict[str, Any] = {
         "status": "unknown",
@@ -391,7 +387,6 @@ async def health_check():
     # Google
     google_key = os.getenv("GOOGLE_TTS_API_KEY")
     if google_key:
-        # 輕量探測：列舉 voices
         try:
             import aiohttp  # type: ignore
             url = f"https://texttospeech.googleapis.com/v1/voices?key={google_key}"
