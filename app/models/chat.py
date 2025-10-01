@@ -1,4 +1,4 @@
-# app/models/chat.py
+# app/models/chat.py - 加入 PID 欄位
 from datetime import datetime
 from sqlalchemy import Column, Integer, String, DateTime, Text, JSON, ForeignKey
 from sqlalchemy.orm import relationship
@@ -8,24 +8,26 @@ class ChatMessage(Base):
     __tablename__ = "chat_messages"
 
     id = Column(Integer, primary_key=True, index=True)
+    
+    # 用戶識別 - 同時保留 user_id 和 pid
     user_id = Column(
         Integer, 
         ForeignKey("users.id", ondelete="CASCADE"), 
         index=True, 
-        nullable=False  # 改為必填,確保有 user_id
+        nullable=False
     )
-
-    # 移除 message_type - 改用 role 欄位
+    pid = Column(String, index=True, nullable=True)  # ✅ 新增: 直接記錄 PID
+    
+    # 訊息內容
     bot_type = Column(String, nullable=True)
     content = Column(Text, nullable=False)
     
-    # 移除 user_mood 和 mood_intensity - 這些資訊不需要在聊天訊息中
-    
-    # 核心欄位
+    # 訊息屬性
     role = Column(String, nullable=False)  # "user" 或 "ai"
     mode = Column(String, default="text")  # "text" 或 "video"
-    meta = Column(JSON, nullable=True)  # 儲存額外資訊
+    meta = Column(JSON, nullable=True)
     
+    # 時間 - 使用 timezone aware
     created_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
 
     # 關聯
