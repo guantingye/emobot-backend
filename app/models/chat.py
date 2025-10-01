@@ -1,6 +1,6 @@
-# app/models/chat.py  
+# app/models/chat.py
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, DateTime, Text, JSON, ForeignKey, func  # ★ 添加 func import
+from sqlalchemy import Column, Integer, String, DateTime, Text, JSON, ForeignKey
 from sqlalchemy.orm import relationship
 from app.db.base import Base
 
@@ -12,20 +12,21 @@ class ChatMessage(Base):
         Integer, 
         ForeignKey("users.id", ondelete="CASCADE"), 
         index=True, 
-        nullable=True
+        nullable=False  # 改為必填,確保有 user_id
     )
 
-    message_type = Column(String, nullable=True, default="user")
+    # 移除 message_type - 改用 role 欄位
     bot_type = Column(String, nullable=True)
     content = Column(Text, nullable=False)
-    user_mood = Column(String, nullable=True)
-    mood_intensity = Column(Integer, nullable=True)
     
-    # 新增的欄位
-    role = Column(String, nullable=False)
-    mode = Column(String, default="text")  
-    meta = Column(JSON, nullable=True)
+    # 移除 user_mood 和 mood_intensity - 這些資訊不需要在聊天訊息中
     
-    created_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)  
+    # 核心欄位
+    role = Column(String, nullable=False)  # "user" 或 "ai"
+    mode = Column(String, default="text")  # "text" 或 "video"
+    meta = Column(JSON, nullable=True)  # 儲存額外資訊
+    
+    created_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
 
+    # 關聯
     user = relationship("User", back_populates="chat_messages", lazy="select")
