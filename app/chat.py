@@ -1,9 +1,9 @@
-# app/chat.py - 完整修正版本
+# app/chat.py - 完整修正版本(修正時區+JWT認證)
 import os
 import asyncio
 import logging
 from typing import List, Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 import aiohttp
 from fastapi import APIRouter, Depends, BackgroundTasks, HTTPException
@@ -14,10 +14,17 @@ from sqlalchemy import func
 from app.db.session import get_db
 from app.models.chat import ChatMessage
 from app.models.user import User
-from app.core.security import get_current_user
+from app.core.security import get_current_user  # ✅ 使用 JWT 認證
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# 台灣時區
+TW_TZ = timezone(timedelta(hours=8))
+
+def get_tw_time():
+    """取得台灣時間"""
+    return datetime.now(TW_TZ)
 
 # ================= Pydantic Models =================
 
@@ -137,27 +144,24 @@ def call_openai(system_prompt: str, messages: List[Dict[str, str]]) -> str:
 
 # ================= 核心聊天端點 =================
 
-# app/chat.py - send_chat 端點的關鍵部分
-
 @router.post("/send", response_model=SendResult)
 async def send_chat(
     payload: SendPayload, 
     background_tasks: BackgroundTasks,
-    user: User = Depends(get_current_user),  # ✅ 使用 JWT 認證
+    user: User = Depends(get_current_user),  # 使用 JWT 認證
     db: Session = Depends(get_db)
 ):
-    """發送聊天訊息"""
+    """發送聊天訊息 - 使用 JWT 認證獲取 user_id"""
     user_msg = (payload.message or "").strip()
     if not user_msg:
         raise HTTPException(status_code=400, detail="Empty message")
 
-    # ✅ 記錄日誌確認 user_id
-    logger.info(f"📨 Chat from user_id={user.id}, pid={user.pid}, bot_type={payload.bot_type}")
+    logger.info(f"Chat message from user_id={user.id}, pid={user.pid}")
 
     try:
-        # ✅ 儲存使用者訊息 - 使用認證的 user.id
+        # 1. 儲存使用者訊息
         user_message = ChatMessage(
-            user_id=user.id,  # ✅ 從 JWT 取得,不是 0 或 NULL
+            user_id=user.id,  # 從 JWT 認證取得
             bot_type=payload.bot_type,
             mode=payload.mode,
             role="user",
@@ -167,7 +171,7 @@ async def send_chat(
         db.add(user_message)
         db.commit()
         
-        # OpenAI 處理...
+        # 2. 準備 OpenAI 請求
         system_prompt = get_enhanced_system_prompt(payload.bot_type)
         bot_name = get_bot_name(payload.bot_type)
         
@@ -177,11 +181,13 @@ async def send_chat(
             messages.append({"role": role, "content": h.get("content", "")})
         
         messages.append({"role": "user", "content": user_msg})
+        
+        # 3. 呼叫 OpenAI
         reply_text = call_openai(system_prompt, messages)
         
-        # ✅ 儲存 AI 回覆 - 同樣使用 user.id
+        # 4. 儲存 AI 回覆
         ai_message = ChatMessage(
-            user_id=user.id,  # ✅ 確保一致
+            user_id=user.id,
             bot_type=payload.bot_type,
             mode=payload.mode,
             role="ai",
@@ -197,10 +203,9 @@ async def send_chat(
         db.add(ai_message)
         db.commit()
         
-        # ✅ 記錄成功日誌
-        logger.info(f"✅ Chat saved: user_id={user.id}, msg_id={ai_message.id}")
+        logger.info(f"Chat success: user_id={user.id}, message_id={ai_message.id}")
         
-        # HeyGen 背景任務...
+        # 5. 如果有 HeyGen session_id,加入背景任務
         if payload.session_id and payload.mode == "video":
             background_tasks.add_task(
                 send_text_to_heygen_background, 
@@ -211,38 +216,50 @@ async def send_chat(
         return SendResult(
             ok=True,
             reply=reply_text,
-            bot={"type": payload.bot_type, "name": bot_name, "persona": "enhanced"},
+            bot={
+                "type": payload.bot_type, 
+                "name": bot_name,
+                "persona": "enhanced"
+            },
             message_id=ai_message.id,
             session_id=payload.session_id,
             error=None
         )
         
     except Exception as e:
-        logger.error(f"❌ Chat error: user_id={user.id}, error={e}")
+        logger.error(f"Send chat failed: user_id={user.id}, error={e}")
         db.rollback()
         
-        # 備用回覆
         fallback_text = get_fallback_reply(payload.bot_type)
         bot_name = get_bot_name(payload.bot_type)
         
         try:
             ai_message = ChatMessage(
-                user_id=user.id,  # ✅ 即使錯誤也要記錄 user_id
+                user_id=user.id,
                 bot_type=payload.bot_type,
                 mode=payload.mode,
                 role="ai",
                 content=fallback_text,
-                meta={"provider": "fallback", "error": str(e)[:200]}
+                meta={
+                    "provider": "fallback", 
+                    "error": str(e)[:200],
+                    "persona": payload.bot_type,
+                    "bot_name": bot_name
+                }
             )
             db.add(ai_message)
             db.commit()
-        except Exception:
-            pass
+        except Exception as db_error:
+            logger.error(f"Failed to save fallback message: {db_error}")
         
         return SendResult(
             ok=True,
             reply=fallback_text,
-            bot={"type": payload.bot_type, "name": bot_name, "persona": "fallback"},
+            bot={
+                "type": payload.bot_type, 
+                "name": bot_name,
+                "persona": "fallback"
+            },
             error=f"API temporarily unavailable: {str(e)[:100]}"
         )
 

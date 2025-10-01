@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI, Depends, HTTPException, Request, Response
@@ -25,6 +25,13 @@ from app.models.chat import ChatMessage
 from app.models.mood import MoodRecord
 from app.models.allowed_pid import AllowedPid
 from app.models.chat_session import ChatSession
+
+# 台灣時區
+TW_TZ = timezone(timedelta(hours=8))
+
+def get_tw_time():
+    """取得台灣時間"""
+    return datetime.now(TW_TZ)
 
 # 路由註冊狀態
 router_status = {
