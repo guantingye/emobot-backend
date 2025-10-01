@@ -10,10 +10,13 @@ class User(Base):
     pid = Column(String, unique=True, index=True, nullable=False)
     nickname = Column(String, nullable=True)
     selected_bot = Column(String, nullable=True)
+    
+    # 時間欄位
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    last_login_at = Column(DateTime(timezone=True), nullable=True)  # 新增:記錄登入時間
 
-    # ★ 修復：使用字符串引用避免循環引用問題
+    # 關聯
     chat_messages = relationship(
         "ChatMessage",
         back_populates="user",
@@ -42,7 +45,6 @@ class User(Base):
         passive_deletes=True,
         lazy="select"
     )
-    # ★ 新增聊天會話關聯
     chat_sessions = relationship(
         "ChatSession",
         back_populates="user",
