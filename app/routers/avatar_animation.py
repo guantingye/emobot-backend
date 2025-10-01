@@ -27,43 +27,36 @@ class AvatarAnimationResponse(BaseModel):
     error: Optional[str] = None
     meta: Optional[Dict[str, Any]] = None
 
-BOT_VOICES = {
-    "empathy": "nova",
-    "insight": "shimmer",
-    "solution": "alloy",
-    "cognitive": "echo"
-}
-
 PERSONA_STYLES = {
     "empathy": {
         "name": "Lumi",
         "voice": "nova",
-        "speaking_rate": 0.95,
-        "pause_factor": 1.25,
+        "speaking_rate": 1.05,
+        "pause_factor": 1.2,
         "energy": 0.75,
         "color": {"start": "#FFB6C1", "end": "#FF8FB1"}
     },
     "insight": {
         "name": "Solin",
         "voice": "shimmer",
-        "speaking_rate": 1.0,
-        "pause_factor": 1.15,
+        "speaking_rate": 1.08,
+        "pause_factor": 1.1,
         "energy": 0.85,
         "color": {"start": "#7AC2DD", "end": "#5A8CF2"}
     },
     "solution": {
         "name": "Niko",
-        "voice": "alloy",
-        "speaking_rate": 1.05,
-        "pause_factor": 1.05,
+        "voice": "nova",
+        "speaking_rate": 1.1,
+        "pause_factor": 1.0,
         "energy": 0.95,
         "color": {"start": "#3AA87A", "end": "#9AE6B4"}
     },
     "cognitive": {
         "name": "Clara",
-        "voice": "echo",
-        "speaking_rate": 1.0,
-        "pause_factor": 1.15,
+        "voice": "alloy",
+        "speaking_rate": 1.08,
+        "pause_factor": 1.1,
         "energy": 0.88,
         "color": {"start": "#7A4DC8", "end": "#B794F4"}
     },
@@ -74,11 +67,9 @@ async def create_avatar_animation(request: AvatarAnimationRequest):
     if not request.text or not request.text.strip():
         raise HTTPException(status_code=400, detail="文字內容不能為空")
 
-    # 標準化並記錄 bot_type
     bot_type = (request.bot_type or "solution").strip().lower()
     logger.info(f"🎯 [TTS Request] bot_type='{bot_type}', text_preview='{request.text[:50]}...'")
     
-    # 獲取對應風格設定
     style = PERSONA_STYLES.get(bot_type, PERSONA_STYLES["solution"])
     selected_voice = style["voice"]
     
@@ -109,7 +100,6 @@ async def create_avatar_animation(request: AvatarAnimationRequest):
 
     ok = mp3_b64 is not None
     
-    # 構建完整的 meta 資訊
     meta_info = {
         "provider": "openai",
         "model": "tts-1",
@@ -193,15 +183,17 @@ async def tts_openai_chunked(text: str, speaking_rate: float, pause_factor: floa
 
     logger.info(f"🎤 [TTS Start] voice='{voice}', chunks={len(chunks)}, text_preview='{text[:50]}...'")
 
+    speed = min(1.8, max(0.5, speaking_rate))
+
     async def synth_one(t: str, chunk_idx: int) -> bytes:
         def _do() -> bytes:
-            logger.info(f"🎵 [Chunk {chunk_idx+1}/{len(chunks)}] voice='{voice}', text='{t[:30]}...'")
+            logger.info(f"🎵 [Chunk {chunk_idx+1}/{len(chunks)}] voice='{voice}', text='{t[:30]}...', speed={speed}")
             res = client.audio.speech.create(
                 model="tts-1",
                 voice=voice,
                 input=t,
                 response_format="mp3",
-                speed=1.0
+                speed=speed
             )
             return res.content
         return await asyncio.to_thread(_do)
@@ -221,7 +213,7 @@ async def tts_openai_chunked(text: str, speaking_rate: float, pause_factor: floa
         out_bytes.extend(result)
         success_count += 1
         if idx < len(results) - 1:
-            await asyncio.sleep(0.05 * pause_factor)
+            await asyncio.sleep(0.04 * pause_factor)
 
     logger.info(f"✅ [TTS Complete] voice='{voice}', success={success_count}/{len(chunks)}, total_bytes={len(out_bytes)}")
 
@@ -230,7 +222,7 @@ async def tts_openai_chunked(text: str, speaking_rate: float, pause_factor: floa
     return base64.b64encode(bytes(out_bytes)).decode("utf-8")
 
 def generate_animation_timeline(text: str, speaking_rate: float, energy: float, pause_factor: float) -> Dict[str, Any]:
-    char_time = 0.11 / max(0.6, speaking_rate)
+    char_time = 0.10 / max(0.6, speaking_rate)
     base_duration = max(2.0, min(24.0, len(text) * char_time))
 
     mouth_frames = []
@@ -238,14 +230,14 @@ def generate_animation_timeline(text: str, speaking_rate: float, energy: float, 
     for i, ch in enumerate(text):
         if ch in ",、:;":
             mouth_frames.append({"time": t, "mouth_openness": 0.05, "type": "pause"})
-            t += 0.12 * pause_factor
+            t += 0.10 * pause_factor
         elif ch in "。!?":
             mouth_frames.append({"time": t, "mouth_openness": 0.02, "type": "pause"})
-            t += 0.20 * pause_factor
+            t += 0.16 * pause_factor
         elif ch.strip():
             openness = 0.3 + 0.6 * ((i % 4) / 3.0)
             mouth_frames.append({"time": t, "mouth_openness": float(openness)})
-            t += 0.09
+            t += 0.08
 
     blink_frames = []
     blink_interval = max(1.5, 2.2 - energy * 0.5)
