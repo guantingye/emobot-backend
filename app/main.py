@@ -287,7 +287,7 @@ def update_me(
         db.refresh(user)
     return {"ok": True, "user": {"pid": user.pid, "nickname": user.nickname}}
 
-# ========== Assessment 端點（注意：複數形式 assessments）==========
+# ========== Assessment 端點（注意：使用 PID）==========
 
 @app.post("/api/assessments/upsert")
 def upsert_assessment(
@@ -295,53 +295,78 @@ def upsert_assessment(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """儲存測驗資料（使用 PID）"""
-    print(f"📝 Saving assessment for PID={user.pid}")
+    """儲存/更新測驗資料（使用 PID，真正的 upsert）"""
+    print(f"📝 [Assessment Upsert] PID={user.pid}, data={body.dict()}")
     
-    # 如果是重新測驗，清除 selected_bot
-    if body.is_retest:
-        user.selected_bot = None
-        db.add(user)
+    try:
+        # 如果是重新測驗，清除 selected_bot
+        if body.is_retest:
+            user.selected_bot = None
+            db.add(user)
+            db.commit()
+            print(f"🔄 Retest mode: cleared selected_bot for PID={user.pid}")
+        
+        # 查找現有的 assessment (使用 PID)
+        a = db.query(Assessment).filter(Assessment.pid == user.pid).first()
+        
+        if not a:
+            # 新建 assessment
+            a = Assessment(pid=user.pid)
+            db.add(a)
+            print(f"✅ Creating new assessment for PID={user.pid}")
+        else:
+            print(f"📝 Updating existing assessment id={a.id} for PID={user.pid}")
+        
+        # 更新欄位（只更新有值的欄位）
+        if body.mbti_raw is not None:
+            a.mbti_raw = body.mbti_raw
+            print(f"  - mbti_raw: {body.mbti_raw}")
+        
+        if body.mbti_encoded is not None:
+            a.mbti_encoded = body.mbti_encoded
+            print(f"  - mbti_encoded: {body.mbti_encoded}")
+        
+        if body.step2_answers is not None:
+            a.step2_answers = body.step2_answers
+            print(f"  - step2_answers: {len(body.step2_answers)} items")
+        
+        if body.step3_answers is not None:
+            a.step3_answers = body.step3_answers
+            print(f"  - step3_answers: {len(body.step3_answers)} items")
+        
+        if body.step4_answers is not None:
+            a.step4_answers = body.step4_answers
+            print(f"  - step4_answers: {len(body.step4_answers)} items")
+        
+        if body.ai_preference is not None:
+            a.ai_preference = body.ai_preference
+        
+        # 提交到資料庫
+        db.commit()
+        db.refresh(a)
+        
+        print(f"✅ Assessment saved successfully: id={a.id}, PID={user.pid}")
+        
+        return {
+            "ok": True,
+            "assessment_id": a.id,
+            "pid": user.pid,
+            "is_retest": body.is_retest or False
+        }
     
-    # 查找或建立 assessment
-    a = db.query(Assessment).filter(Assessment.pid == user.pid).first()
-    
-    if not a:
-        a = Assessment(pid=user.pid)
-        db.add(a)
-    
-    # 更新欄位
-    if body.mbti_raw is not None:
-        a.mbti_raw = body.mbti_raw
-    if body.mbti_encoded is not None:
-        a.mbti_encoded = body.mbti_encoded
-    if body.step2_answers is not None:
-        a.step2_answers = body.step2_answers
-    if body.step3_answers is not None:
-        a.step3_answers = body.step3_answers
-    if body.step4_answers is not None:
-        a.step4_answers = body.step4_answers
-    if body.ai_preference is not None:
-        a.ai_preference = body.ai_preference
-    
-    db.commit()
-    db.refresh(a)
-    
-    print(f"✅ Assessment saved: id={a.id}, PID={user.pid}")
-    
-    return {
-        "ok": True,
-        "assessment_id": a.id,
-        "is_retest": body.is_retest or False
-    }
+    except Exception as e:
+        db.rollback()
+        print(f"❌ Assessment save failed for PID={user.pid}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to save assessment: {str(e)}")
 
 @app.get("/api/assessments/me")
 def get_my_assessment(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """取得測驗資料"""
+    """取得測驗資料（使用 PID）"""
     a = db.query(Assessment).filter(Assessment.pid == user.pid).first()
+    
     if not a:
         return {"assessment": None}
     
