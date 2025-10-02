@@ -287,7 +287,17 @@ def update_me(
         db.refresh(user)
     return {"ok": True, "user": {"pid": user.pid, "nickname": user.nickname}}
 
-# ========== Assessment 端點（注意：使用 PID）==========
+# ========== Assessment 端點（完整版本）==========
+
+class AssessmentUpsert(BaseModel):
+    mbti_raw: Optional[str] = None
+    mbti_encoded: Optional[List[int]] = None  # [0/1, 0/1, 0/1, 0/1]
+    step2_answers: Optional[List[int]] = None
+    step3_answers: Optional[List[int]] = None
+    step4_answers: Optional[List[int]] = None
+    ai_preference: Optional[Dict[str, Any]] = None
+    submittedAt: Optional[str] = None
+    is_retest: Optional[bool] = False
 
 @app.post("/api/assessments/upsert")
 def upsert_assessment(
@@ -295,8 +305,12 @@ def upsert_assessment(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """儲存/更新測驗資料（使用 PID，真正的 upsert）"""
-    print(f"📝 [Assessment Upsert] PID={user.pid}, data={body.dict()}")
+    """儲存/更新測驗資料（使用 PID）"""
+    print(f"📝 [Assessment Upsert] PID={user.pid}")
+    print(f"   Body: mbti_raw={body.mbti_raw}, mbti_encoded={body.mbti_encoded}")
+    print(f"   step2={len(body.step2_answers) if body.step2_answers else 0}, "
+          f"step3={len(body.step3_answers) if body.step3_answers else 0}, "
+          f"step4={len(body.step4_answers) if body.step4_answers else 0}")
     
     try:
         # 如果是重新測驗，清除 selected_bot
@@ -313,39 +327,52 @@ def upsert_assessment(
             # 新建 assessment
             a = Assessment(pid=user.pid)
             db.add(a)
-            print(f"✅ Creating new assessment for PID={user.pid}")
+            print(f"✅ Creating NEW assessment for PID={user.pid}")
         else:
-            print(f"📝 Updating existing assessment id={a.id} for PID={user.pid}")
+            print(f"📝 Updating EXISTING assessment id={a.id} for PID={user.pid}")
         
         # 更新欄位（只更新有值的欄位）
+        updated_fields = []
+        
         if body.mbti_raw is not None:
             a.mbti_raw = body.mbti_raw
-            print(f"  - mbti_raw: {body.mbti_raw}")
+            updated_fields.append(f"mbti_raw={body.mbti_raw}")
         
         if body.mbti_encoded is not None:
             a.mbti_encoded = body.mbti_encoded
-            print(f"  - mbti_encoded: {body.mbti_encoded}")
+            updated_fields.append(f"mbti_encoded={body.mbti_encoded}")
         
         if body.step2_answers is not None:
             a.step2_answers = body.step2_answers
-            print(f"  - step2_answers: {len(body.step2_answers)} items")
+            updated_fields.append(f"step2_answers({len(body.step2_answers)} items)")
         
         if body.step3_answers is not None:
             a.step3_answers = body.step3_answers
-            print(f"  - step3_answers: {len(body.step3_answers)} items")
+            updated_fields.append(f"step3_answers({len(body.step3_answers)} items)")
         
         if body.step4_answers is not None:
             a.step4_answers = body.step4_answers
-            print(f"  - step4_answers: {len(body.step4_answers)} items")
+            updated_fields.append(f"step4_answers({len(body.step4_answers)} items)")
         
         if body.ai_preference is not None:
             a.ai_preference = body.ai_preference
+            updated_fields.append("ai_preference")
+        
+        print(f"📊 Updated fields: {', '.join(updated_fields)}")
         
         # 提交到資料庫
         db.commit()
         db.refresh(a)
         
-        print(f"✅ Assessment saved successfully: id={a.id}, PID={user.pid}")
+        print(f"✅ Assessment COMMITTED successfully: id={a.id}, PID={user.pid}")
+        
+        # 驗證資料已存入
+        verify = db.query(Assessment).filter(Assessment.id == a.id).first()
+        if verify:
+            print(f"✅ VERIFIED in DB: id={verify.id}, pid={verify.pid}, "
+                  f"mbti_raw={verify.mbti_raw}, has_step2={verify.step2_answers is not None}")
+        else:
+            print(f"⚠️ WARNING: Could not verify assessment id={a.id}")
         
         return {
             "ok": True,
@@ -356,7 +383,10 @@ def upsert_assessment(
     
     except Exception as e:
         db.rollback()
-        print(f"❌ Assessment save failed for PID={user.pid}: {e}")
+        print(f"❌ Assessment save FAILED for PID={user.pid}")
+        print(f"❌ Error details: {type(e).__name__}: {str(e)}")
+        import traceback
+        print(f"❌ Traceback: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Failed to save assessment: {str(e)}")
 
 @app.get("/api/assessments/me")
@@ -365,10 +395,15 @@ def get_my_assessment(
     db: Session = Depends(get_db)
 ):
     """取得測驗資料（使用 PID）"""
+    print(f"📖 [Get Assessment] PID={user.pid}")
+    
     a = db.query(Assessment).filter(Assessment.pid == user.pid).first()
     
     if not a:
+        print(f"ℹ️ No assessment found for PID={user.pid}")
         return {"assessment": None}
+    
+    print(f"✅ Found assessment id={a.id} for PID={user.pid}")
     
     return {
         "assessment": {
@@ -379,7 +414,7 @@ def get_my_assessment(
             "step2_answers": a.step2_answers,
             "step3_answers": a.step3_answers,
             "step4_answers": a.step4_answers,
-            "created_at": a.created_at.isoformat() + "Z"
+            "created_at": a.created_at.isoformat() + "Z" if a.created_at else None
         }
     }
 
