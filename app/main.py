@@ -1,4 +1,4 @@
-# backend/app/main.py - 完整版本，改用 PID 為主鍵
+# backend/app/main.py - 修正 CORS 和端點路徑
 from __future__ import annotations
 
 import os
@@ -14,7 +14,6 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-# App internals
 from app.core.config import settings
 from app.core.security import create_access_token, get_current_user
 from app.db.session import get_db, engine
@@ -25,7 +24,7 @@ from app.models.recommendation import Recommendation
 from app.models.chat import ChatMessage
 from app.models.allowed_pid import AllowedPid
 
-# 路由註冊狀態追蹤
+# 路由註冊狀態
 router_status = {
     "chat": {"loaded": False, "error": None},
     "avatar_animation": {"loaded": False, "error": None}
@@ -38,33 +37,26 @@ try:
         raise ImportError("chat.py 中沒有定義 router")
     router_status["chat"]["loaded"] = True
     print("✅ Chat 模組載入成功")
-except ImportError as e:
-    router_status["chat"]["error"] = f"導入錯誤: {e}"
-    print(f"❌ Chat 模組載入失敗: {e}")
 except Exception as e:
-    router_status["chat"]["error"] = f"其他錯誤: {e}"
-    print(f"❌ Chat 模組錯誤: {e}")
+    router_status["chat"]["error"] = str(e)
+    print(f"❌ Chat 模組載入失敗: {e}")
 
-# 載入頭像動畫路由（可選）
+# 載入頭像動畫路由
 try:
     from app.routers import avatar_animation
     router_status["avatar_animation"]["loaded"] = True
     print("✅ 頭像動畫模組載入成功")
-except ImportError as e:
-    router_status["avatar_animation"]["error"] = f"導入錯誤: {e}"
-    print(f"⚠️ 頭像動畫模組載入失敗: {e}")
 except Exception as e:
-    router_status["avatar_animation"]["error"] = f"其他錯誤: {e}"
-    print(f"⚠️ 頭像動畫模組錯誤: {e}")
+    router_status["avatar_animation"]["error"] = str(e)
+    print(f"⚠️ 頭像動畫模組載入失敗: {e}")
 
-# 推薦引擎（可選）
+# 推薦引擎
 try:
     from app.services.recommendation_engine import recommend_endpoint_payload as _build_reco
 except Exception:
     _build_reco = None
 
 def _fallback_build_reco(user: Dict[str, Any] | None, assessment: Dict[str, Any] | None) -> Dict[str, Any]:
-    """簡單、可重現的回退推薦：由 mbti_encoded[0:4] 推出四型分數（0~1），回傳 0~100 的排序結果。"""
     empathy = insight = solution = cognitive = 0.25
     if assessment:
         enc = assessment.get("mbti_encoded")
@@ -109,117 +101,102 @@ def build_recommendation_payload(user: Dict[str, Any] | None, assessment: Dict[s
             return _fallback_build_reco(user, assessment)
     return _fallback_build_reco(user, assessment)
 
-# FastAPI App 初始化
+# FastAPI App
 app = FastAPI(
     title="Emobot Backend",
     version="0.7.0",
     description="心理對話機器人系統 - 以 PID 為主鍵"
 )
 
-# CORS 設定
-ALLOWED = getattr(settings, "ALLOWED_ORIGINS", os.getenv(
+# CORS 設定（強化版）
+ALLOWED = os.getenv(
     "ALLOWED_ORIGINS",
     "https://emobot-plus.vercel.app,http://localhost:5173,http://localhost:3000"
-))
+)
 
 def _parse_allowed(origins_str: str) -> List[str]:
     out: List[str] = []
     for s in (origins_str or "").split(","):
         s = s.strip()
-        if not s or s in ("*", "null"):
-            continue
-        out.append(s)
+        if s and s not in ("*", "null"):
+            out.append(s)
     return out
 
 _ALLOWED_ORIGINS = _parse_allowed(ALLOWED)
 _VERCEL_REGEX_STR = r"^https://.*\.vercel\.app$"
 _VERCEL_REGEX = re.compile(_VERCEL_REGEX_STR, re.IGNORECASE)
 
+# 第一層：標準 CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_ALLOWED_ORIGINS,
     allow_origin_regex=_VERCEL_REGEX_STR,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["*"],
+    max_age=86400,
 )
 
+# 第二層：確保 OPTIONS 正確處理
 @app.middleware("http")
-async def _force_cors_headers(request: Request, call_next):
-    origin = request.headers.get("origin")
-    is_allowed = bool(origin and (origin in _ALLOWED_ORIGINS or _VERCEL_REGEX.match(origin or "")))
-
-    if request.method.upper() == "OPTIONS":
-        acrm = request.headers.get("access-control-request-method", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
-        acrh = request.headers.get("access-control-request-headers", "Authorization,Content-Type,X-Requested-With")
+async def cors_middleware(request: Request, call_next):
+    origin = request.headers.get("origin", "")
+    is_allowed = origin in _ALLOWED_ORIGINS or (_VERCEL_REGEX.match(origin) if origin else False)
+    
+    # 處理 OPTIONS preflight
+    if request.method == "OPTIONS":
         headers = {
             "Access-Control-Allow-Origin": origin if is_allowed else "",
-            "Access-Control-Allow-Credentials": "true" if is_allowed else "false",
-            "Access-Control-Allow-Methods": acrm,
-            "Access-Control-Allow-Headers": acrh,
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Requested-With, Accept",
             "Access-Control-Max-Age": "86400",
-            "Access-Control-Expose-Headers": "*",
             "Vary": "Origin",
         }
-        return Response(status_code=204, headers=headers)
-
+        return Response(status_code=200, headers=headers)
+    
+    # 處理正常請求
     try:
-        resp = await call_next(request)
-    except HTTPException as he:
-        resp = JSONResponse({"detail": he.detail}, status_code=he.status_code)
-    except Exception:
-        resp = JSONResponse({"detail": "Internal Server Error"}, status_code=500)
-
+        response = await call_next(request)
+    except Exception as e:
+        print(f"Request error: {e}")
+        response = JSONResponse(
+            {"detail": "Internal Server Error"},
+            status_code=500
+        )
+    
+    # 添加 CORS headers
     if is_allowed:
-        resp.headers.setdefault("Access-Control-Allow-Origin", origin)
-        resp.headers.setdefault("Access-Control-Allow-Credentials", "true")
-        resp.headers.setdefault("Access-Control-Expose-Headers", "*")
-        vary = resp.headers.get("Vary")
-        resp.headers["Vary"] = "Origin" if not vary else (vary if "Origin" in vary else f"{vary}, Origin")
-    return resp
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Expose-Headers"] = "*"
+        response.headers["Vary"] = "Origin"
+    
+    return response
 
 @app.on_event("startup")
 def on_startup():
     try:
         Base.metadata.create_all(bind=engine)
+        print("✅ 資料表初始化完成")
     except Exception as e:
-        print(f"⚠️ 資料表建立略過/失敗：{e}")
+        print(f"⚠️ 資料表建立失敗：{e}")
 
-# 路由註冊（優先順序：頭像動畫 > Chat）
+# 路由註冊
 if router_status["avatar_animation"]["loaded"]:
     try:
         app.include_router(avatar_animation.router, prefix="/api/chat/avatar", tags=["avatar-animation"])
-        print("✅ 頭像動畫路由註冊成功: /api/chat/avatar")
+        print("✅ 頭像動畫路由註冊成功")
     except Exception as e:
-        router_status["avatar_animation"]["error"] = f"路由註冊失敗: {e}"
         print(f"❌ 頭像動畫路由註冊失敗: {e}")
 
 if router_status["chat"]["loaded"]:
     try:
-        chat_router = chat_module.router
-        app.include_router(chat_router, prefix="/api/chat", tags=["chat"])
-        print("✅ Chat 路由註冊成功: /api/chat")
+        app.include_router(chat_module.router, prefix="/api/chat", tags=["chat"])
+        print("✅ Chat 路由註冊成功")
     except Exception as e:
-        router_status["chat"]["error"] = f"路由註冊失敗: {e}"
         print(f"❌ Chat 路由註冊失敗: {e}")
-
-# 緊急後備路由（當主要路由失敗時）
-if not router_status["chat"]["loaded"]:
-    from fastapi import APIRouter
-    emergency_router = APIRouter()
-
-    @emergency_router.get("/health")
-    async def emergency_health():
-        return {
-            "ok": False,
-            "error": "Chat router 載入失敗",
-            "details": router_status["chat"]["error"],
-            "emergency_mode": True
-        }
-
-    app.include_router(emergency_router, prefix="/api/chat", tags=["emergency"])
-    print("🚨 緊急後備路由已啟動")
 
 # Pydantic Models
 class JoinRequest(BaseModel):
@@ -241,15 +218,16 @@ class MatchChoice(BaseModel):
 
 # Helper Functions
 def is_pid_allowed(pid: str, db: Session) -> bool:
-    """檢查 PID 是否在允許清單中且為啟用狀態"""
     allowed_pid = db.query(AllowedPid).filter(
         AllowedPid.pid == pid,
         AllowedPid.is_active == True
     ).first()
     return allowed_pid is not None
 
-# Auth & Profile
-def _auth_join(body: JoinRequest, db: Session):
+# ========== 認證端點 ==========
+
+@app.post("/api/auth/join")
+def join(body: JoinRequest, db: Session = Depends(get_db)):
     pid = (body.pid or "").strip()
     if not pid:
         raise HTTPException(status_code=422, detail="pid is required")
@@ -264,15 +242,14 @@ def _auth_join(body: JoinRequest, db: Session):
     if not user:
         user = User(pid=pid, nickname=body.nickname or None)
         db.add(user)
-        db.commit()
-        db.refresh(user)
     else:
         if body.nickname and user.nickname != body.nickname:
             user.nickname = body.nickname
         user.last_login_at = datetime.utcnow()
         db.add(user)
-        db.commit()
-        db.refresh(user)
+    
+    db.commit()
+    db.refresh(user)
 
     token = create_access_token(pid=user.pid)
     return {
@@ -283,10 +260,6 @@ def _auth_join(body: JoinRequest, db: Session):
             "selected_bot": user.selected_bot
         }
     }
-
-@app.post("/api/auth/join")
-def join(body: JoinRequest, db: Session = Depends(get_db)):
-    return _auth_join(body, db)
 
 @app.get("/api/user/me")
 def get_me(user: User = Depends(get_current_user)):
@@ -314,19 +287,30 @@ def update_me(
         db.refresh(user)
     return {"ok": True, "user": {"pid": user.pid, "nickname": user.nickname}}
 
-# Assessment Endpoints
-@app.post("/api/assessment/upsert")
+# ========== Assessment 端點（注意：複數形式 assessments）==========
+
+@app.post("/api/assessments/upsert")
 def upsert_assessment(
     body: AssessmentUpsert,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    """儲存測驗資料（使用 PID）"""
+    print(f"📝 Saving assessment for PID={user.pid}")
+    
+    # 如果是重新測驗，清除 selected_bot
+    if body.is_retest:
+        user.selected_bot = None
+        db.add(user)
+    
+    # 查找或建立 assessment
     a = db.query(Assessment).filter(Assessment.pid == user.pid).first()
     
     if not a:
         a = Assessment(pid=user.pid)
         db.add(a)
     
+    # 更新欄位
     if body.mbti_raw is not None:
         a.mbti_raw = body.mbti_raw
     if body.mbti_encoded is not None:
@@ -343,29 +327,24 @@ def upsert_assessment(
     db.commit()
     db.refresh(a)
     
+    print(f"✅ Assessment saved: id={a.id}, PID={user.pid}")
+    
     return {
         "ok": True,
-        "assessment": {
-            "id": a.id,
-            "pid": a.pid,
-            "mbti_raw": a.mbti_raw,
-            "mbti_encoded": a.mbti_encoded,
-            "step2_answers": a.step2_answers,
-            "step3_answers": a.step3_answers,
-            "step4_answers": a.step4_answers,
-            "ai_preference": a.ai_preference,
-            "created_at": a.created_at.isoformat() + "Z"
-        }
+        "assessment_id": a.id,
+        "is_retest": body.is_retest or False
     }
 
-@app.get("/api/assessment/me")
+@app.get("/api/assessments/me")
 def get_my_assessment(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    """取得測驗資料"""
     a = db.query(Assessment).filter(Assessment.pid == user.pid).first()
     if not a:
         return {"assessment": None}
+    
     return {
         "assessment": {
             "id": a.id,
@@ -379,7 +358,8 @@ def get_my_assessment(
         }
     }
 
-# Match/Recommendation Endpoints
+# ========== Match/Recommendation 端點 ==========
+
 @app.post("/api/match/recommend")
 def recommend(
     user: User = Depends(get_current_user),
@@ -436,7 +416,7 @@ def choose_bot(
 ):
     valid = {"empathy", "insight", "solution", "cognitive"}
     if body.bot_type not in valid:
-        raise HTTPException(status_code=422, detail=f"Invalid bot_type, must be one of {sorted(valid)}")
+        raise HTTPException(status_code=422, detail=f"Invalid bot_type")
 
     user.selected_bot = body.bot_type
     db.add(user)
@@ -470,18 +450,23 @@ def my_match(user: User = Depends(get_current_user), db: Session = Depends(get_d
         [{"type": k, "score": round(float(v) * 100, 2)} for k, v in (rec.scores or {}).items()],
         key=lambda x: x["score"], reverse=True
     ) if rec.scores else []
+    
     return {
         "selected_bot": user.selected_bot,
         "latest_recommendation": {
             "id": rec.id,
             "scores": rec.scores,
-            "top": {"type": rec.selected_bot or (ranked[0]["type"] if ranked else None), "score": ranked[0]["score"] if ranked else 0},
+            "top": {
+                "type": rec.selected_bot or (ranked[0]["type"] if ranked else None),
+                "score": ranked[0]["score"] if ranked else 0
+            },
             "selected_bot": rec.selected_bot,
             "created_at": rec.created_at.isoformat() + "Z"
         }
     }
 
-# Health & Debug
+# ========== Health & Debug ==========
+
 @app.get("/api/health")
 def health():
     return {
@@ -492,11 +477,7 @@ def health():
             "chat_router": router_status["chat"]["loaded"],
             "avatar_animation": router_status["avatar_animation"]["loaded"]
         },
-        "errors": {k: v["error"] for k, v in router_status.items() if v["error"]},
-        "environment": {
-            "openai_configured": bool(os.getenv("OPENAI_API_KEY")),
-            "database_configured": bool(os.getenv("DATABASE_URL"))
-        }
+        "errors": {k: v["error"] for k, v in router_status.items() if v["error"]}
     }
 
 @app.get("/api/debug/db-test")
@@ -513,10 +494,6 @@ def system_status(db: Session = Depends(get_db)):
         total_users = db.query(User).count()
         total_assessments = db.query(Assessment).count()
         total_chat_messages = db.query(ChatMessage).count()
-        
-        yesterday = datetime.utcnow() - timedelta(days=1)
-        recent_messages = db.query(ChatMessage).filter(ChatMessage.created_at >= yesterday).count()
-        recent_assessments = db.query(Assessment).filter(Assessment.created_at >= yesterday).count()
 
         return {
             "ok": True,
@@ -525,27 +502,12 @@ def system_status(db: Session = Depends(get_db)):
             "stats": {
                 "total_users": total_users,
                 "total_assessments": total_assessments,
-                "total_chat_messages": total_chat_messages,
-                "recent_24h": {
-                    "messages": recent_messages,
-                    "assessments": recent_assessments
-                }
-            },
-            "services": {
-                "database": True,
-                "openai": bool(os.getenv("OPENAI_API_KEY")),
-                "chat_router": router_status["chat"]["loaded"],
-                "avatar_animation": router_status["avatar_animation"]["loaded"]
+                "total_chat_messages": total_chat_messages
             }
         }
     except Exception as e:
-        return {
-            "ok": False,
-            "error": str(e),
-            "timestamp": datetime.utcnow().isoformat() + "Z"
-        }
+        return {"ok": False, "error": str(e)}
 
-# Root endpoint
 @app.get("/")
 def root():
     return {
@@ -554,15 +516,9 @@ def root():
         "status": "running",
         "docs": "/docs",
         "health": "/api/health",
-        "features": {
-            "chat_router": router_status["chat"]["loaded"],
-            "avatar_animation": router_status["avatar_animation"]["loaded"]
-        },
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "notes": "以 PID 為主鍵的心理對話機器人系統"
+        "timestamp": datetime.utcnow().isoformat() + "Z"
     }
 
-# 啟動（本機開發用；Render 會自動偵測 PORT）
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "10000"))
