@@ -1,9 +1,9 @@
-# backend/app/main.py - 修正 CORS 和端點路徑
+# backend/app/main.py - 完整版本（修正時區為台灣時間 UTC+8）
 from __future__ import annotations
 
 import os
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI, Depends, HTTPException, Request, Response
@@ -24,7 +24,35 @@ from app.models.recommendation import Recommendation
 from app.models.chat import ChatMessage
 from app.models.allowed_pid import AllowedPid
 
+# ============================================================================
+# 台灣時區工具函數
+# ============================================================================
+
+TW_TZ = timezone(timedelta(hours=8))
+
+def get_tw_time() -> datetime:
+    """取得當前台灣時間（帶時區資訊）"""
+    return datetime.now(TW_TZ)
+
+def utc_to_tw(utc_time: datetime) -> datetime:
+    """將 UTC 時間轉換為台灣時間"""
+    if utc_time is None:
+        return None
+    if utc_time.tzinfo is None:
+        utc_time = utc_time.replace(tzinfo=timezone.utc)
+    return utc_time.astimezone(TW_TZ)
+
+def format_tw_time(dt: datetime) -> str:
+    """格式化台灣時間為 ISO 字串"""
+    if dt is None:
+        return None
+    tw_dt = utc_to_tw(dt) if dt.tzinfo != TW_TZ else dt
+    return tw_dt.isoformat()
+
+# ============================================================================
 # 路由註冊狀態
+# ============================================================================
+
 router_status = {
     "chat": {"loaded": False, "error": None},
     "avatar_animation": {"loaded": False, "error": None}
@@ -101,14 +129,17 @@ def build_recommendation_payload(user: Dict[str, Any] | None, assessment: Dict[s
             return _fallback_build_reco(user, assessment)
     return _fallback_build_reco(user, assessment)
 
+# ============================================================================
 # FastAPI App
+# ============================================================================
+
 app = FastAPI(
     title="Emobot Backend",
     version="0.7.0",
-    description="心理對話機器人系統 - 以 PID 為主鍵"
+    description="心理對話機器人系統 - 以 PID 為主鍵（台灣時區 UTC+8）"
 )
 
-# CORS 設定（強化版）
+# CORS 設定
 ALLOWED = os.getenv(
     "ALLOWED_ORIGINS",
     "https://emobot-plus.vercel.app,http://localhost:5173,http://localhost:3000"
@@ -126,7 +157,6 @@ _ALLOWED_ORIGINS = _parse_allowed(ALLOWED)
 _VERCEL_REGEX_STR = r"^https://.*\.vercel\.app$"
 _VERCEL_REGEX = re.compile(_VERCEL_REGEX_STR, re.IGNORECASE)
 
-# 第一層：標準 CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_ALLOWED_ORIGINS,
@@ -138,13 +168,11 @@ app.add_middleware(
     max_age=86400,
 )
 
-# 第二層：確保 OPTIONS 正確處理
 @app.middleware("http")
 async def cors_middleware(request: Request, call_next):
     origin = request.headers.get("origin", "")
     is_allowed = origin in _ALLOWED_ORIGINS or (_VERCEL_REGEX.match(origin) if origin else False)
     
-    # 處理 OPTIONS preflight
     if request.method == "OPTIONS":
         headers = {
             "Access-Control-Allow-Origin": origin if is_allowed else "",
@@ -156,17 +184,12 @@ async def cors_middleware(request: Request, call_next):
         }
         return Response(status_code=200, headers=headers)
     
-    # 處理正常請求
     try:
         response = await call_next(request)
     except Exception as e:
         print(f"Request error: {e}")
-        response = JSONResponse(
-            {"detail": "Internal Server Error"},
-            status_code=500
-        )
+        response = JSONResponse({"detail": "Internal Server Error"}, status_code=500)
     
-    # 添加 CORS headers
     if is_allowed:
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
@@ -198,25 +221,47 @@ if router_status["chat"]["loaded"]:
     except Exception as e:
         print(f"❌ Chat 路由註冊失敗: {e}")
 
+if not router_status["chat"]["loaded"]:
+    from fastapi import APIRouter
+    emergency_router = APIRouter()
+
+    @emergency_router.get("/health")
+    async def emergency_health():
+        return {
+            "ok": False,
+            "error": "Chat router 載入失敗",
+            "details": router_status["chat"]["error"],
+            "emergency_mode": True
+        }
+
+    app.include_router(emergency_router, prefix="/api/chat", tags=["emergency"])
+    print("🚨 緊急後備路由已啟動")
+
+# ============================================================================
 # Pydantic Models
+# ============================================================================
+
 class JoinRequest(BaseModel):
     pid: str = Field(..., min_length=1, max_length=50)
     nickname: Optional[str] = Field(default=None, max_length=100)
 
 class AssessmentUpsert(BaseModel):
     mbti_raw: Optional[str] = None
-    mbti_encoded: Optional[List[float]] = None
-    step2_answers: Optional[List[Any]] = None
-    step3_answers: Optional[List[Any]] = None
-    step4_answers: Optional[List[Any]] = None
+    mbti_encoded: Optional[List[int]] = None
+    step2_answers: Optional[List[int]] = None
+    step3_answers: Optional[List[int]] = None
+    step4_answers: Optional[List[int]] = None
     ai_preference: Optional[Dict[str, Any]] = None
-    submittedAt: Optional[datetime] = None
+    submittedAt: Optional[str] = None
     is_retest: Optional[bool] = False
 
 class MatchChoice(BaseModel):
     bot_type: str = Field(..., description="empathy | insight | solution | cognitive")
 
+# ============================================================================
 # Helper Functions
+# ============================================================================
+
 def is_pid_allowed(pid: str, db: Session) -> bool:
     allowed_pid = db.query(AllowedPid).filter(
         AllowedPid.pid == pid,
@@ -224,7 +269,9 @@ def is_pid_allowed(pid: str, db: Session) -> bool:
     ).first()
     return allowed_pid is not None
 
-# ========== 認證端點 ==========
+# ============================================================================
+# 認證端點
+# ============================================================================
 
 @app.post("/api/auth/join")
 def join(body: JoinRequest, db: Session = Depends(get_db)):
@@ -238,15 +285,23 @@ def join(body: JoinRequest, db: Session = Depends(get_db)):
             detail="此 PID 未被授權使用系統，請聯繫管理員"
         )
 
+    tw_time = get_tw_time()
     user = db.query(User).filter(User.pid == pid).first()
+    
     if not user:
-        user = User(pid=pid, nickname=body.nickname or None)
+        user = User(
+            pid=pid, 
+            nickname=body.nickname or None,
+            last_login_at=tw_time
+        )
         db.add(user)
+        print(f"✅ 新用戶註冊: PID={pid}, TW Time={tw_time.strftime('%Y-%m-%d %H:%M:%S')}")
     else:
         if body.nickname and user.nickname != body.nickname:
             user.nickname = body.nickname
-        user.last_login_at = datetime.utcnow()
+        user.last_login_at = tw_time
         db.add(user)
+        print(f"✅ 用戶登入: PID={pid}, TW Time={tw_time.strftime('%Y-%m-%d %H:%M:%S')}")
     
     db.commit()
     db.refresh(user)
@@ -257,7 +312,8 @@ def join(body: JoinRequest, db: Session = Depends(get_db)):
         "user": {
             "pid": user.pid,
             "nickname": user.nickname,
-            "selected_bot": user.selected_bot
+            "selected_bot": user.selected_bot,
+            "last_login_at": format_tw_time(user.last_login_at)
         }
     }
 
@@ -269,8 +325,8 @@ def get_me(user: User = Depends(get_current_user)):
             "pid": user.pid,
             "nickname": user.nickname,
             "selected_bot": user.selected_bot,
-            "last_login_at": user.last_login_at.isoformat() + "Z" if user.last_login_at else None,
-            "created_at": user.created_at.isoformat() + "Z" if user.created_at else None
+            "last_login_at": format_tw_time(user.last_login_at),
+            "created_at": format_tw_time(user.created_at)
         }
     }
 
@@ -287,17 +343,9 @@ def update_me(
         db.refresh(user)
     return {"ok": True, "user": {"pid": user.pid, "nickname": user.nickname}}
 
-# ========== Assessment 端點（完整版本）==========
-
-class AssessmentUpsert(BaseModel):
-    mbti_raw: Optional[str] = None
-    mbti_encoded: Optional[List[int]] = None  # [0/1, 0/1, 0/1, 0/1]
-    step2_answers: Optional[List[int]] = None
-    step3_answers: Optional[List[int]] = None
-    step4_answers: Optional[List[int]] = None
-    ai_preference: Optional[Dict[str, Any]] = None
-    submittedAt: Optional[str] = None
-    is_retest: Optional[bool] = False
+# ============================================================================
+# Assessment 端點
+# ============================================================================
 
 @app.post("/api/assessments/upsert")
 def upsert_assessment(
@@ -305,33 +353,26 @@ def upsert_assessment(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """儲存/更新測驗資料（使用 PID）"""
-    print(f"📝 [Assessment Upsert] PID={user.pid}")
-    print(f"   Body: mbti_raw={body.mbti_raw}, mbti_encoded={body.mbti_encoded}")
-    print(f"   step2={len(body.step2_answers) if body.step2_answers else 0}, "
-          f"step3={len(body.step3_answers) if body.step3_answers else 0}, "
-          f"step4={len(body.step4_answers) if body.step4_answers else 0}")
+    """儲存/更新測驗資料（使用台灣時間）"""
+    tw_time = get_tw_time()
+    print(f"📝 [Assessment Upsert] PID={user.pid}, TW Time={tw_time.strftime('%Y-%m-%d %H:%M:%S')}")
     
     try:
-        # 如果是重新測驗，清除 selected_bot
         if body.is_retest:
             user.selected_bot = None
             db.add(user)
             db.commit()
             print(f"🔄 Retest mode: cleared selected_bot for PID={user.pid}")
         
-        # 查找現有的 assessment (使用 PID)
         a = db.query(Assessment).filter(Assessment.pid == user.pid).first()
         
         if not a:
-            # 新建 assessment
-            a = Assessment(pid=user.pid)
+            a = Assessment(pid=user.pid, created_at=tw_time)
             db.add(a)
             print(f"✅ Creating NEW assessment for PID={user.pid}")
         else:
             print(f"📝 Updating EXISTING assessment id={a.id} for PID={user.pid}")
         
-        # 更新欄位（只更新有值的欄位）
         updated_fields = []
         
         if body.mbti_raw is not None:
@@ -344,15 +385,15 @@ def upsert_assessment(
         
         if body.step2_answers is not None:
             a.step2_answers = body.step2_answers
-            updated_fields.append(f"step2_answers({len(body.step2_answers)} items)")
+            updated_fields.append(f"step2({len(body.step2_answers)} items)")
         
         if body.step3_answers is not None:
             a.step3_answers = body.step3_answers
-            updated_fields.append(f"step3_answers({len(body.step3_answers)} items)")
+            updated_fields.append(f"step3({len(body.step3_answers)} items)")
         
         if body.step4_answers is not None:
             a.step4_answers = body.step4_answers
-            updated_fields.append(f"step4_answers({len(body.step4_answers)} items)")
+            updated_fields.append(f"step4({len(body.step4_answers)} items)")
         
         if body.ai_preference is not None:
             a.ai_preference = body.ai_preference
@@ -360,50 +401,36 @@ def upsert_assessment(
         
         print(f"📊 Updated fields: {', '.join(updated_fields)}")
         
-        # 提交到資料庫
         db.commit()
         db.refresh(a)
         
-        print(f"✅ Assessment COMMITTED successfully: id={a.id}, PID={user.pid}")
-        
-        # 驗證資料已存入
-        verify = db.query(Assessment).filter(Assessment.id == a.id).first()
-        if verify:
-            print(f"✅ VERIFIED in DB: id={verify.id}, pid={verify.pid}, "
-                  f"mbti_raw={verify.mbti_raw}, has_step2={verify.step2_answers is not None}")
-        else:
-            print(f"⚠️ WARNING: Could not verify assessment id={a.id}")
+        print(f"✅ Assessment saved: id={a.id}, PID={user.pid}, TW Time={format_tw_time(a.created_at)}")
         
         return {
             "ok": True,
             "assessment_id": a.id,
             "pid": user.pid,
+            "created_at": format_tw_time(a.created_at),
             "is_retest": body.is_retest or False
         }
     
     except Exception as e:
         db.rollback()
-        print(f"❌ Assessment save FAILED for PID={user.pid}")
-        print(f"❌ Error details: {type(e).__name__}: {str(e)}")
+        print(f"❌ Assessment save FAILED: {e}")
         import traceback
         print(f"❌ Traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Failed to save assessment: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to save: {str(e)}")
 
 @app.get("/api/assessments/me")
 def get_my_assessment(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """取得測驗資料（使用 PID）"""
-    print(f"📖 [Get Assessment] PID={user.pid}")
-    
+    """取得測驗資料（台灣時間）"""
     a = db.query(Assessment).filter(Assessment.pid == user.pid).first()
     
     if not a:
-        print(f"ℹ️ No assessment found for PID={user.pid}")
         return {"assessment": None}
-    
-    print(f"✅ Found assessment id={a.id} for PID={user.pid}")
     
     return {
         "assessment": {
@@ -414,17 +441,21 @@ def get_my_assessment(
             "step2_answers": a.step2_answers,
             "step3_answers": a.step3_answers,
             "step4_answers": a.step4_answers,
-            "created_at": a.created_at.isoformat() + "Z" if a.created_at else None
+            "created_at": format_tw_time(a.created_at)
         }
     }
 
-# ========== Match/Recommendation 端點 ==========
+# ============================================================================
+# Match/Recommendation 端點
+# ============================================================================
 
 @app.post("/api/match/recommend")
 def recommend(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    print(f"🎯 [Recommend] PID={user.pid}")
+    
     a = db.query(Assessment).filter(Assessment.pid == user.pid).first()
     if not a:
         raise HTTPException(status_code=400, detail="No assessment found")
@@ -438,6 +469,7 @@ def recommend(
         "step3_answers": a.step3_answers,
         "step4_answers": a.step4_answers
     }
+    
     result = build_recommendation_payload(user_payload, assess_payload)
     if not result or not result.get("scores"):
         raise HTTPException(status_code=500, detail="Recommendation engine failed")
@@ -449,15 +481,18 @@ def recommend(
     )
     top_type = ranked[0]["type"] if ranked else None
 
+    tw_time = get_tw_time()
     rec = Recommendation(
         pid=user.pid,
         scores=scores,
         selected_bot=None,
-        created_at=datetime.utcnow()
+        created_at=tw_time
     )
     db.add(rec)
     db.commit()
     db.refresh(rec)
+
+    print(f"✅ Recommendation created: id={rec.id}, PID={user.pid}, top={top_type}")
 
     return {
         "ok": True,
@@ -465,6 +500,7 @@ def recommend(
         "ranked": ranked,
         "top": {"type": top_type, "score": ranked[0]["score"] if ranked else 0},
         "recommendation_id": rec.id,
+        "created_at": format_tw_time(rec.created_at),
         "algorithm_version": result.get("algorithm_version")
     }
 
@@ -492,6 +528,8 @@ def choose_bot(
         latest_rec.selected_bot = body.bot_type
         db.add(latest_rec)
         db.commit()
+
+    print(f"✅ Bot selected: PID={user.pid}, bot={body.bot_type}")
 
     return {"ok": True, "selected_bot": user.selected_bot}
 
@@ -521,18 +559,23 @@ def my_match(user: User = Depends(get_current_user), db: Session = Depends(get_d
                 "score": ranked[0]["score"] if ranked else 0
             },
             "selected_bot": rec.selected_bot,
-            "created_at": rec.created_at.isoformat() + "Z"
+            "created_at": format_tw_time(rec.created_at)
         }
     }
 
-# ========== Health & Debug ==========
+# ============================================================================
+# Health & Debug
+# ============================================================================
 
 @app.get("/api/health")
 def health():
+    tw_now = get_tw_time()
     return {
         "ok": True,
-        "time": datetime.utcnow().isoformat() + "Z",
+        "time": format_tw_time(tw_now),
+        "time_tw": tw_now.strftime("%Y-%m-%d %H:%M:%S"),
         "version": "0.7.0",
+        "timezone": "Asia/Taipei (UTC+8)",
         "features": {
             "chat_router": router_status["chat"]["loaded"],
             "avatar_animation": router_status["avatar_animation"]["loaded"]
@@ -557,8 +600,9 @@ def system_status(db: Session = Depends(get_db)):
 
         return {
             "ok": True,
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": format_tw_time(get_tw_time()),
             "version": "0.7.0",
+            "timezone": "Asia/Taipei (UTC+8)",
             "stats": {
                 "total_users": total_users,
                 "total_assessments": total_assessments,
@@ -576,7 +620,8 @@ def root():
         "status": "running",
         "docs": "/docs",
         "health": "/api/health",
-        "timestamp": datetime.utcnow().isoformat() + "Z"
+        "timezone": "Asia/Taipei (UTC+8)",
+        "timestamp": format_tw_time(get_tw_time())
     }
 
 if __name__ == "__main__":

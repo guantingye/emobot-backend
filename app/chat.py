@@ -15,7 +15,7 @@ from app.db.session import get_db
 from app.models.chat import ChatMessage
 from app.models.user import User
 from app.core.security import get_current_user
-
+from app.core.timezone import get_tw_time, format_tw_time
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
@@ -119,33 +119,30 @@ async def send_chat(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """發送聊天訊息 - 只記錄 PID"""
+    """發送聊天訊息 - 使用台灣時間"""
     user_msg = (payload.message or "").strip()
     if not user_msg:
         raise HTTPException(status_code=400, detail="Empty message")
 
     tw_time = get_tw_time()
-    print(f"📨 [TW {tw_time.strftime('%H:%M:%S')}] Chat from PID={user.pid}, bot={payload.bot_type}")
-    logger.info(f"Chat from PID={user.pid}")
+    print(f"📨 [TW {tw_time.strftime('%Y-%m-%d %H:%M:%S')}] Chat from PID={user.pid}")
 
     try:
-        # 1. 儲存使用者訊息
+        # 儲存使用者訊息
         user_message = ChatMessage(
             pid=user.pid,
             bot_type=payload.bot_type,
             mode=payload.mode,
             role="user",
             content=user_msg,
-            created_at=tw_time,
+            created_at=tw_time,  # ✅ 台灣時間
             meta={"demo": payload.demo, "session_id": payload.session_id}
         )
         db.add(user_message)
         db.commit()
         db.refresh(user_message)
         
-        print(f"✅ User msg saved: id={user_message.id}, PID={user.pid}")
-        
-        # 2. 準備 OpenAI 請求
+        # 呼叫 OpenAI
         system_prompt = get_enhanced_system_prompt(payload.bot_type)
         bot_name = get_bot_name(payload.bot_type)
         
@@ -153,21 +150,18 @@ async def send_chat(
         for h in (payload.history or [])[-10:]:
             role = "assistant" if h.get("role") == "assistant" else "user"
             messages.append({"role": role, "content": h.get("content", "")})
-        
         messages.append({"role": "user", "content": user_msg})
         
-        # 3. 呼叫 OpenAI
         reply_text = call_openai(system_prompt, messages)
         
-        # 4. 儲存 AI 回覆
-        ai_tw_time = get_tw_time()
+        # 儲存 AI 回覆
         ai_message = ChatMessage(
             pid=user.pid,
             bot_type=payload.bot_type,
             mode=payload.mode,
             role="ai",
             content=reply_text,
-            created_at=ai_tw_time,
+            created_at=get_tw_time(),  # ✅ 台灣時間
             meta={
                 "provider": "openai",
                 "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
@@ -180,61 +174,21 @@ async def send_chat(
         db.commit()
         db.refresh(ai_message)
         
-        print(f"✅ AI msg saved: id={ai_message.id}, PID={user.pid}")
-        logger.info(f"Chat success: PID={user.pid}, user_msg={user_message.id}, ai_msg={ai_message.id}")
+        print(f"✅ Chat saved: PID={user.pid}, TW={format_tw_time(ai_message.created_at)}")
         
         return SendResult(
             ok=True,
             reply=reply_text,
-            bot={
-                "type": payload.bot_type,
-                "name": bot_name,
-                "persona": "enhanced"
-            },
+            bot={"type": payload.bot_type, "name": bot_name, "persona": "enhanced"},
             message_id=ai_message.id,
             session_id=payload.session_id,
             error=None
         )
         
     except Exception as e:
-        error_time = get_tw_time()
-        print(f"❌ [TW {error_time.strftime('%H:%M:%S')}] Chat error: PID={user.pid}, error={str(e)[:100]}")
-        logger.error(f"Chat failed: PID={user.pid}, error={e}")
         db.rollback()
-        
-        fallback_text = get_fallback_reply(payload.bot_type)
-        bot_name = get_bot_name(payload.bot_type)
-        
-        try:
-            ai_message = ChatMessage(
-                pid=user.pid,
-                bot_type=payload.bot_type,
-                mode=payload.mode,
-                role="ai",
-                content=fallback_text,
-                created_at=get_tw_time(),
-                meta={
-                    "provider": "fallback",
-                    "error": str(e)[:200],
-                    "persona": payload.bot_type,
-                    "bot_name": bot_name
-                }
-            )
-            db.add(ai_message)
-            db.commit()
-        except Exception as db_error:
-            logger.error(f"Failed to save fallback: {db_error}")
-        
-        return SendResult(
-            ok=True,
-            reply=fallback_text,
-            bot={
-                "type": payload.bot_type,
-                "name": bot_name,
-                "persona": "fallback"
-            },
-            error=f"API temporarily unavailable: {str(e)[:100]}"
-        )
+        print(f"❌ Chat error: {e}")
+        raise
 
 # ================= 聊天歷史與統計 =================
 
