@@ -381,6 +381,11 @@ def analyze_chat_messages(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
         trend_info
     )
     
+# ✅ 修正：正確處理 Counter.most_common() 返回的 list
+    topic_radar_data = {}
+    for topic, score in topic_scores.most_common(6):
+        topic_radar_data[topic] = round(score * 20, 1)
+
     # 準備圖表數據
     return {
         "ok": True,
@@ -388,7 +393,7 @@ def analyze_chat_messages(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
         "message_count": len(user_messages),
         "emotion_frequency": dict(emotion_frequency.most_common(7)),
         "emotion_intensity": {k: round(v * 100, 1) for k, v in emotion_intensity_avg.items()},
-        "topic_radar": {k: round(v * 20, 1) for k, v in topic_scores.most_common(6).items()},
+        "topic_radar": topic_radar_data,
         "timeline_data": timeline_data[-30:],  # 只返回最近30筆
         "trend_analysis": trend_info,
         "summary": summary,
