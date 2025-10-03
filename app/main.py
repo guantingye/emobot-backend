@@ -347,71 +347,74 @@ def update_me(
 # Assessment 端點
 # ============================================================================
 
-@app.post("/api/assessments/upsert")
-def upsert_assessment(
+@app.post("/api/assessments/save")
+def save_assessment(
     body: AssessmentUpsert,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """儲存/更新測驗資料（使用台灣時間）"""
+    """
+    儲存測驗資料（每次都新增一筆記錄，不覆蓋舊資料）
+    """
     tw_time = get_tw_time()
-    print(f"📝 [Assessment Upsert] PID={user.pid}, TW Time={tw_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"📝 [Assessment Save] PID={user.pid}, TW Time={tw_time.strftime('%Y-%m-%d %H:%M:%S')}")
     
     try:
+        # ✅ 如果是重測，清除 selected_bot
         if body.is_retest:
             user.selected_bot = None
             db.add(user)
             db.commit()
             print(f"🔄 Retest mode: cleared selected_bot for PID={user.pid}")
         
-        a = db.query(Assessment).filter(Assessment.pid == user.pid).first()
+        # ✅ 每次都新增一筆記錄
+        a = Assessment(
+            pid=user.pid,
+            created_at=tw_time,
+            is_retest=body.is_retest or False
+        )
         
-        if not a:
-            a = Assessment(pid=user.pid, created_at=tw_time)
-            db.add(a)
-            print(f"✅ Creating NEW assessment for PID={user.pid}")
-        else:
-            print(f"📝 Updating EXISTING assessment id={a.id} for PID={user.pid}")
-        
-        updated_fields = []
-        
+        # 設定測驗資料
         if body.mbti_raw is not None:
             a.mbti_raw = body.mbti_raw
-            updated_fields.append(f"mbti_raw={body.mbti_raw}")
         
         if body.mbti_encoded is not None:
             a.mbti_encoded = body.mbti_encoded
-            updated_fields.append(f"mbti_encoded={body.mbti_encoded}")
         
         if body.step2_answers is not None:
             a.step2_answers = body.step2_answers
-            updated_fields.append(f"step2({len(body.step2_answers)} items)")
         
         if body.step3_answers is not None:
             a.step3_answers = body.step3_answers
-            updated_fields.append(f"step3({len(body.step3_answers)} items)")
         
         if body.step4_answers is not None:
             a.step4_answers = body.step4_answers
-            updated_fields.append(f"step4({len(body.step4_answers)} items)")
         
         if body.ai_preference is not None:
             a.ai_preference = body.ai_preference
-            updated_fields.append("ai_preference")
         
-        print(f"📊 Updated fields: {', '.join(updated_fields)}")
+        # ✅ 如果所有步驟都完成，設定完成時間
+        if all([
+            a.mbti_raw,
+            a.step2_answers,
+            a.step3_answers,
+            a.step4_answers
+        ]):
+            a.completed_at = tw_time
+            print(f"✅ Assessment completed at: {format_tw_time(a.completed_at)}")
         
+        db.add(a)
         db.commit()
         db.refresh(a)
         
-        print(f"✅ Assessment saved: id={a.id}, PID={user.pid}, TW Time={format_tw_time(a.created_at)}")
+        print(f"✅ NEW Assessment saved: id={a.id}, PID={user.pid}, TW Time={format_tw_time(a.created_at)}")
         
         return {
             "ok": True,
             "assessment_id": a.id,
             "pid": user.pid,
             "created_at": format_tw_time(a.created_at),
-            "is_retest": body.is_retest or False
+            "is_retest": a.is_retest
         }
     
     except Exception as e:
@@ -421,13 +424,20 @@ def upsert_assessment(
         print(f"❌ Traceback: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Failed to save: {str(e)}")
 
+
 @app.get("/api/assessments/me")
 def get_my_assessment(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """取得測驗資料（台灣時間）"""
-    a = db.query(Assessment).filter(Assessment.pid == user.pid).first()
+    """
+    取得最新的測驗資料（按創建時間排序）
+    """
+    # ✅ 查詢該用戶最新的一筆測驗記錄
+    a = db.query(Assessment)\
+        .filter(Assessment.pid == user.pid)\
+        .order_by(Assessment.created_at.desc())\
+        .first()
     
     if not a:
         return {"assessment": None}
@@ -441,8 +451,42 @@ def get_my_assessment(
             "step2_answers": a.step2_answers,
             "step3_answers": a.step3_answers,
             "step4_answers": a.step4_answers,
-            "created_at": format_tw_time(a.created_at)
+            "is_retest": a.is_retest,
+            "created_at": format_tw_time(a.created_at),
+            "completed_at": format_tw_time(a.completed_at) if a.completed_at else None
         }
+    }
+
+
+@app.get("/api/assessments/history")
+def get_assessment_history(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    limit: int = 10
+):
+    """
+    取得該用戶的所有測驗歷史記錄
+    """
+    assessments = db.query(Assessment)\
+        .filter(Assessment.pid == user.pid)\
+        .order_by(Assessment.created_at.desc())\
+        .limit(limit)\
+        .all()
+    
+    return {
+        "ok": True,
+        "count": len(assessments),
+        "assessments": [
+            {
+                "id": a.id,
+                "pid": a.pid,
+                "mbti_raw": a.mbti_raw,
+                "is_retest": a.is_retest,
+                "created_at": format_tw_time(a.created_at),
+                "completed_at": format_tw_time(a.completed_at) if a.completed_at else None
+            }
+            for a in assessments
+        ]
     }
 
 # ============================================================================
