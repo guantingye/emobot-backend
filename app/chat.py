@@ -282,3 +282,35 @@ async def get_chat_stats(
     except Exception as e:
         logger.error(f"Failed to fetch stats: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch stats")
+
+@router.get("/first-time-check/{bot_type}")
+async def check_first_time_chat(
+    bot_type: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """檢查用戶是否第一次與該機器人對話"""
+    try:
+        # 查詢該用戶與該機器人的歷史訊息
+        existing_messages = (
+            db.query(ChatMessage)
+            .filter(
+                ChatMessage.pid == user.pid,
+                ChatMessage.bot_type == bot_type
+            )
+            .limit(1)
+            .first()
+        )
+        
+        is_first_time = existing_messages is None
+        
+        return {
+            "ok": True,
+            "is_first_time": is_first_time,
+            "bot_type": bot_type,
+            "pid": user.pid
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to check first time: {e}")
+        raise HTTPException(status_code=500, detail="Failed to check first time chat")
