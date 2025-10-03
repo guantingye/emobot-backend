@@ -23,7 +23,7 @@ from app.models.assessment import Assessment
 from app.models.recommendation import Recommendation
 from app.models.chat import ChatMessage
 from app.models.allowed_pid import AllowedPid
-
+from app.services.emotion_analyzer import analyze_chat_messages
 # ============================================================================
 # 台灣時區工具函數
 # ============================================================================
@@ -628,3 +628,66 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "10000"))
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+
+@app.get("/api/mood/analysis")
+def get_mood_analysis(
+    days: int = 30,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    取得使用者的專業心情分析數據
+    要求至少 20 次對話才能進行分析
+    """
+    print(f"📊 [Mood Analysis] PID={user.pid}, days={days}")
+    
+    try:
+        # 計算時間範圍
+        start_date = get_tw_time() - timedelta(days=days)
+        
+        # 查詢使用者的聊天訊息
+        messages = (
+            db.query(ChatMessage)
+            .filter(
+                ChatMessage.pid == user.pid,
+                ChatMessage.created_at >= start_date
+            )
+            .order_by(ChatMessage.created_at.asc())
+            .all()
+        )
+        
+        # 轉換為字典格式
+        messages_data = [{
+            "content": msg.content,
+            "role": msg.role,
+            "created_at": format_tw_time(msg.created_at)
+        } for msg in messages]
+        
+        # 執行情緒分析
+        analysis = analyze_chat_messages(messages_data)
+        
+        if not analysis.get("has_sufficient_data"):
+            return {
+                "ok": False,
+                "has_sufficient_data": False,
+                "message_count": analysis.get("message_count", 0),
+                "required_count": 20,
+                "message": analysis.get("message", "對話次數不足"),
+                "data": None
+            }
+        
+        print(f"✅ Analysis complete: {len(messages)} messages, sufficient data")
+        
+        return {
+            "ok": True,
+            "has_sufficient_data": True,
+            "pid": user.pid,
+            "period_days": days,
+            "data": analysis
+        }
+        
+    except Exception as e:
+        print(f"❌ Mood analysis failed: {e}")
+        import traceback
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
