@@ -46,7 +46,7 @@ PERSONA_STYLES = {
     },
     "solution": {
         "name": "Niko",
-        "voice": "nova",
+        "voice": "ballad",
         "speaking_rate": 1.1,
         "pause_factor": 1.0,
         "energy": 0.95,
