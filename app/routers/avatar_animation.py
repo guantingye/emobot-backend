@@ -30,7 +30,7 @@ class AvatarAnimationResponse(BaseModel):
 PERSONA_STYLES = {
     "empathy": {
         "name": "Lumi",
-        "voice": "coral",
+        "voice": "fable",
         "speaking_rate": 1.05,
         "pause_factor": 1.2,
         "energy": 0.75,
@@ -38,7 +38,7 @@ PERSONA_STYLES = {
     },
     "insight": {
         "name": "Solin",
-        "voice": "shimmer",
+        "voice": "alloy",
         "speaking_rate": 1.08,
         "pause_factor": 1.1,
         "energy": 0.85,
@@ -54,7 +54,7 @@ PERSONA_STYLES = {
     },
     "cognitive": {
         "name": "Clara",
-        "voice": "alloy",
+        "voice": "shimmer",
         "speaking_rate": 1.08,
         "pause_factor": 1.1,
         "energy": 0.88,
