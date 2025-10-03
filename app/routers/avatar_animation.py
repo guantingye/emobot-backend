@@ -30,7 +30,7 @@ class AvatarAnimationResponse(BaseModel):
 PERSONA_STYLES = {
     "empathy": {
         "name": "Lumi",
-        "voice": "nova",
+        "voice": "coral",
         "speaking_rate": 1.05,
         "pause_factor": 1.2,
         "energy": 0.75,
@@ -46,7 +46,7 @@ PERSONA_STYLES = {
     },
     "solution": {
         "name": "Niko",
-        "voice": "ballad",
+        "voice": "nova",
         "speaking_rate": 1.1,
         "pause_factor": 1.0,
         "energy": 0.95,
