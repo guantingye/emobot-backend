@@ -715,7 +715,7 @@ def get_mood_analysis(
                 "ok": False,
                 "has_sufficient_data": False,
                 "message_count": analysis.get("message_count", 0),
-                "required_count": 20,
+                "required_count": 30,
                 "message": analysis.get("message", "對話次數不足"),
                 "data": None
             }
