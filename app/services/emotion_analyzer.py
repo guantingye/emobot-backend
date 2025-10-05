@@ -242,8 +242,8 @@ def generate_professional_summary(
     使用心理學術語，提供具體建議
     """
     
-    if message_count < 20:
-        return f"目前對話次數為 {message_count} 次，建議累積至少 20 次對話後再進行完整分析，以獲得更準確的心理狀態評估。"
+    if message_count < 30:
+        return f"目前對話次數為 {message_count} 次，建議累積至少 30 次對話後再進行完整分析，以獲得更準確的心理狀態評估。"
     
     summary_parts = []
     
@@ -303,13 +303,13 @@ def analyze_chat_messages(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
     # 只分析使用者訊息
     user_messages = [m for m in messages if m.get("role") == "user"]
     
-    if len(user_messages) < 20:
+    if len(user_messages) < 30:
         return {
             "ok": False,
             "has_sufficient_data": False,
             "message_count": len(user_messages),
-            "required_count": 20,
-            "message": f"目前對話次數為 {len(user_messages)} 次，至少需要 20 次對話才能進行完整分析"
+            "required_count": 30,
+            "message": f"目前對話次數為 {len(user_messages)} 次，至少需要 30 次對話才能進行完整分析"
         }
     
     # 初始化統計容器
