@@ -31,33 +31,33 @@ PERSONA_STYLES = {
     "empathy": {
         "name": "Lumi",
         "voice": "fable",
-        "speaking_rate": 1.05,
-        "pause_factor": 1.2,
-        "energy": 0.75,
+        "speaking_rate": 0.95,
+        "pause_factor": 1.4,
+        "energy": 0.65,
         "color": {"start": "#FFB6C1", "end": "#FF8FB1"}
     },
     "insight": {
         "name": "Solin",
         "voice": "alloy",
-        "speaking_rate": 1.08,
-        "pause_factor": 1.1,
-        "energy": 0.85,
+        "speaking_rate": 0.98,
+        "pause_factor": 1.3,
+        "energy": 0.75,
         "color": {"start": "#7AC2DD", "end": "#5A8CF2"}
     },
     "solution": {
         "name": "Niko",
         "voice": "nova",
-        "speaking_rate": 1.1,
-        "pause_factor": 1.0,
-        "energy": 0.95,
+        "speaking_rate": 1.0,
+        "pause_factor": 1.2,
+        "energy": 0.85,
         "color": {"start": "#3AA87A", "end": "#9AE6B4"}
     },
     "cognitive": {
         "name": "Clara",
         "voice": "shimmer",
-        "speaking_rate": 1.08,
-        "pause_factor": 1.1,
-        "energy": 0.88,
+        "speaking_rate": 0.98,
+        "pause_factor": 1.3,
+        "energy": 0.78,
         "color": {"start": "#7A4DC8", "end": "#B794F4"}
     },
 }
@@ -68,12 +68,12 @@ async def create_avatar_animation(request: AvatarAnimationRequest):
         raise HTTPException(status_code=400, detail="文字內容不能為空")
 
     bot_type = (request.bot_type or "solution").strip().lower()
-    logger.info(f"🎯 [TTS Request] bot_type='{bot_type}', text_preview='{request.text[:50]}...'")
+    logger.info(f"[TTS Request] bot_type='{bot_type}', text_preview='{request.text[:50]}...'")
     
     style = PERSONA_STYLES.get(bot_type, PERSONA_STYLES["solution"])
     selected_voice = style["voice"]
     
-    logger.info(f"🎤 [Voice Mapping] bot_type='{bot_type}' → voice='{selected_voice}'")
+    logger.info(f"[Voice Mapping] bot_type='{bot_type}' -> voice='{selected_voice}'")
 
     text = sanitize_text(request.text.strip())
     if len(text) > 1600:
@@ -94,15 +94,15 @@ async def create_avatar_animation(request: AvatarAnimationRequest):
             pause_factor=style["pause_factor"],
             voice=selected_voice
         )
-        logger.info(f"✅ [TTS Success] voice='{selected_voice}', audio_size={len(mp3_b64) if mp3_b64 else 0}")
+        logger.info(f"[TTS Success] voice='{selected_voice}', audio_size={len(mp3_b64) if mp3_b64 else 0}")
     except Exception as e:
-        logger.exception(f"❌ [TTS Failed] voice='{selected_voice}', error={str(e)}")
+        logger.exception(f"[TTS Failed] voice='{selected_voice}', error={str(e)}")
 
     ok = mp3_b64 is not None
     
     meta_info = {
         "provider": "openai",
-        "model": "tts-1",
+        "model": "tts-1-hd",
         "bot_type": bot_type,
         "voice": selected_voice,
         "speaking_rate": style["speaking_rate"],
@@ -113,14 +113,14 @@ async def create_avatar_animation(request: AvatarAnimationRequest):
         "text_length": len(text)
     }
     
-    logger.info(f"📦 [Response Meta] {meta_info}")
+    logger.info(f"[Response Meta] {meta_info}")
     
     return AvatarAnimationResponse(
         success=ok,
         audio_base64=f"data:audio/mp3;base64,{mp3_b64}" if ok else None,
         animation_data=animation,
         duration=animation.get("total_duration", 3.0),
-        error=None if ok else "TTS 生成失敗,僅顯示動畫(靜音)。",
+        error=None if ok else "TTS生成失敗,僅顯示動畫(靜音)。",
         meta=meta_info
     )
 
@@ -139,7 +139,7 @@ async def get_styles():
     return {"styles": PERSONA_STYLES}
 
 def sanitize_text(text: str) -> str:
-    return re.sub(r"[^\u4e00-\u9fffA-Za-z0-9,。!?、:;「」『』()…\s]", "", text)
+    return re.sub(r"[^\u4e00-\u9fffA-Za-z0-9,。!?、:;「」『』()\s]", "", text)
 
 def split_text_for_tts(text: str, max_len: int = 200) -> List[str]:
     parts = re.split(r"([。!?])", text)
@@ -181,15 +181,15 @@ async def tts_openai_chunked(text: str, speaking_rate: float, pause_factor: floa
     from openai import OpenAI
     client = OpenAI(api_key=api_key)
 
-    logger.info(f"🎤 [TTS Start] voice='{voice}', chunks={len(chunks)}, text_preview='{text[:50]}...'")
+    logger.info(f"[TTS Start] voice='{voice}', chunks={len(chunks)}, text_preview='{text[:50]}...'")
 
     speed = min(1.8, max(0.5, speaking_rate))
 
     async def synth_one(t: str, chunk_idx: int) -> bytes:
         def _do() -> bytes:
-            logger.info(f"🎵 [Chunk {chunk_idx+1}/{len(chunks)}] voice='{voice}', text='{t[:30]}...', speed={speed}")
+            logger.info(f"[Chunk {chunk_idx+1}/{len(chunks)}] voice='{voice}', text='{t[:30]}...', speed={speed}")
             res = client.audio.speech.create(
-                model="tts-1",
+                model="tts-1-hd",
                 voice=voice,
                 input=t,
                 response_format="mp3",
@@ -205,17 +205,17 @@ async def tts_openai_chunked(text: str, speaking_rate: float, pause_factor: floa
     success_count = 0
     for idx, result in enumerate(results):
         if isinstance(result, Exception):
-            logger.warning(f"⚠️ Chunk {idx} failed: {result}")
+            logger.warning(f"Chunk {idx} failed: {result}")
             continue
         if not result or len(result) < 500:
-            logger.warning(f"⚠️ Chunk {idx} too small: {len(result) if result else 0}")
+            logger.warning(f"Chunk {idx} too small: {len(result) if result else 0}")
             continue
         out_bytes.extend(result)
         success_count += 1
         if idx < len(results) - 1:
             await asyncio.sleep(0.04 * pause_factor)
 
-    logger.info(f"✅ [TTS Complete] voice='{voice}', success={success_count}/{len(chunks)}, total_bytes={len(out_bytes)}")
+    logger.info(f"[TTS Complete] voice='{voice}', success={success_count}/{len(chunks)}, total_bytes={len(out_bytes)}")
 
     if len(out_bytes) < 800:
         return None
@@ -232,46 +232,19 @@ def generate_animation_timeline(text: str, speaking_rate: float, energy: float, 
             mouth_frames.append({"time": t, "mouth_openness": 0.05, "type": "pause"})
             t += 0.10 * pause_factor
         elif ch in "。!?":
-            mouth_frames.append({"time": t, "mouth_openness": 0.02, "type": "pause"})
-            t += 0.16 * pause_factor
-        elif ch.strip():
-            openness = 0.3 + 0.6 * ((i % 4) / 3.0)
-            mouth_frames.append({"time": t, "mouth_openness": float(openness)})
-            t += 0.08
+            mouth_frames.append({"time": t, "mouth_openness": 0.1, "type": "stop"})
+            t += 0.20 * pause_factor
+        else:
+            open_val = 0.4 + (0.3 * energy) if ch not in " \n" else 0.05
+            mouth_frames.append({"time": t, "mouth_openness": open_val, "type": "talk"})
+            t += char_time
 
-    blink_frames = []
-    blink_interval = max(1.5, 2.2 - energy * 0.5)
-    bt = blink_interval
-    while bt < base_duration + 1.0:
-        blink_frames.extend([
-            {"time": bt, "eye_state": "closing"},
-            {"time": bt + 0.08, "eye_state": "closed"},
-            {"time": bt + 0.15, "eye_state": "opening"},
-            {"time": bt + 0.22, "eye_state": "open"},
-        ])
-        bt += blink_interval
+    total_duration = max(base_duration, t + 0.5)
 
-    head_frames = []
-    ht = 0.0
-    amp = 0.5 + energy * 0.5
-    while ht < base_duration + 0.5:
-        head_frames.append({
-            "time": ht,
-            "head_x": round(amp * 0.5 * (0.5 - (ht % 3) / 3), 3),
-            "head_y": round(amp * 0.3 * (0.5 - (ht % 5) / 5), 3),
-        })
-        ht += 0.42
-
-    total = max(base_duration, mouth_frames[-1]["time"] + 0.5 if mouth_frames else 2.5)
     return {
-        "total_duration": float(total),
-        "mouth_animation": mouth_frames,
-        "blink_animation": blink_frames,
-        "head_animation": head_frames,
-        "metadata": {
-            "text_length": len(text),
-            "generated_at": datetime.utcnow().isoformat() + "Z",
-            "speaking_rate": speaking_rate,
-            "pause_factor": pause_factor
-        }
+        "total_duration": total_duration,
+        "mouth_frames": mouth_frames,
+        "energy": energy,
+        "speaking_rate": speaking_rate,
+        "pause_factor": pause_factor
     }
