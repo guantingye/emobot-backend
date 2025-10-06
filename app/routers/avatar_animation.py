@@ -33,7 +33,7 @@ PERSONA_STYLES = {
         "voice": "fable",
         "speaking_rate": 0.95,
         "pause_factor": 1.4,
-        "energy": 0.77,
+        "energy": 0.86,
         "color": {"start": "#FFB6C1", "end": "#FF8FB1"}
     },
     "insight": {
@@ -57,7 +57,7 @@ PERSONA_STYLES = {
         "voice": "shimmer",
         "speaking_rate": 0.98,
         "pause_factor": 1.3,
-        "energy": 0.77,
+        "energy": 0.86,
         "color": {"start": "#7A4DC8", "end": "#B794F4"}
     },
 }
