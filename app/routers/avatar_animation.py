@@ -33,7 +33,7 @@ PERSONA_STYLES = {
         "voice": "fable",
         "speaking_rate": 0.95,
         "pause_factor": 1.4,
-        "energy": 0.50,
+        "energy": 0.77,
         "color": {"start": "#FFB6C1", "end": "#FF8FB1"}
     },
     "insight": {
@@ -41,7 +41,7 @@ PERSONA_STYLES = {
         "voice": "alloy",
         "speaking_rate": 0.98,
         "pause_factor": 1.3,
-        "energy": 0.50,
+        "energy": 0.77,
         "color": {"start": "#7AC2DD", "end": "#5A8CF2"}
     },
     "solution": {
@@ -49,7 +49,7 @@ PERSONA_STYLES = {
         "voice": "nova",
         "speaking_rate": 1.0,
         "pause_factor": 1.2,
-        "energy": 0.85,
+        "energy": 0.77,
         "color": {"start": "#3AA87A", "end": "#9AE6B4"}
     },
     "cognitive": {
@@ -57,7 +57,7 @@ PERSONA_STYLES = {
         "voice": "shimmer",
         "speaking_rate": 0.98,
         "pause_factor": 1.3,
-        "energy": 0.50,
+        "energy": 0.77,
         "color": {"start": "#7A4DC8", "end": "#B794F4"}
     },
 }
