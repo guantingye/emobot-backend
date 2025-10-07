@@ -27,38 +27,38 @@ class AvatarAnimationResponse(BaseModel):
     error: Optional[str] = None
     meta: Optional[Dict[str, Any]] = None
 
-PERSONA_STYLES = {
-    "empathy": {
+PERSONA_STYLES: Dict[str, dict] = {
+    "empathy": {   # Lumi（平和的亞洲年輕女性）
         "name": "Lumi",
-        "voice": "fable",
-        "speaking_rate": 0.95,
-        "pause_factor": 1.4,
-        "energy": 0.86,
-        "color": {"start": "#FFB6C1", "end": "#FF8FB1"}
+        "voice": "nova",         # ← 改為 nova
+        "speaking_rate": 0.93,   # 更慢更柔
+        "pause_factor": 1.40,    # 停頓更長
+        "energy": 0.80,          # 更溫和
+        "color": {"start": "#FFB6C1", "end": "#FF8FB1"},
     },
-    "insight": {
+    "insight": {   # Solin（維持）
         "name": "Solin",
-        "voice": "alloy",
+        "voice": "nova",
         "speaking_rate": 0.98,
-        "pause_factor": 1.3,
+        "pause_factor": 1.30,
         "energy": 0.77,
-        "color": {"start": "#7AC2DD", "end": "#5A8CF2"}
+        "color": {"start": "#7AC2DD", "end": "#5A8CF2"},
     },
-    "solution": {
+    "solution": {  # Niko（維持）
         "name": "Niko",
         "voice": "nova",
-        "speaking_rate": 1.0,
-        "pause_factor": 1.2,
-        "energy": 0.77,
-        "color": {"start": "#3AA87A", "end": "#9AE6B4"}
+        "speaking_rate": 1.00,
+        "pause_factor": 1.20,
+        "energy": 0.97,
+        "color": {"start": "#3AA87A", "end": "#9AE6B4"},
     },
-    "cognitive": {
+    "cognitive": { # Clara（更年輕、清亮的亞洲女性）
         "name": "Clara",
-        "voice": "shimmer",
-        "speaking_rate": 0.98,
-        "pause_factor": 1.3,
-        "energy": 0.86,
-        "color": {"start": "#7A4DC8", "end": "#B794F4"}
+        "voice": "nova",         # ← 改為 nova
+        "speaking_rate": 1.02,   # 稍快更清亮
+        "pause_factor": 1.22,    # 停頓略短
+        "energy": 0.92,          # 更有精神但不尖
+        "color": {"start": "#7A4DC8", "end": "#B794F4"},
     },
 }
 
