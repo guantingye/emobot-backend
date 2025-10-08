@@ -240,6 +240,8 @@ if not router_status["chat"]["loaded"]:
 # ============================================================================
 # Pydantic Models
 # ============================================================================
+class AdminLoginRequest(BaseModel):
+    admin_key: str
 
 class JoinRequest(BaseModel):
     pid: str = Field(..., min_length=1, max_length=50)
@@ -776,3 +778,23 @@ def get_mood_analysis(
         import traceback
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+
+@app.post("/api/admin/login")
+def admin_login(body: AdminLoginRequest, db: Session = Depends(get_db)):
+    """管理員登入驗證"""
+    ADMIN_KEY = os.getenv("ADMIN_KEY", "")
+    
+    if not ADMIN_KEY:
+        raise HTTPException(status_code=500, detail="Admin system not configured")
+    
+    if body.admin_key != ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="Invalid admin key")
+    
+    # 生成管理員 token
+    admin_token = create_access_token(pid="ADMIN")
+    
+    return {
+        "ok": True,
+        "token": admin_token,
+        "message": "Admin login successful"
+    }
