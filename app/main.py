@@ -9,7 +9,7 @@ from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, Depends, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -24,9 +24,6 @@ from app.models.recommendation import Recommendation
 from app.models.chat import ChatMessage
 from app.models.allowed_pid import AllowedPid
 from app.services.emotion_analyzer import analyze_chat_messages
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
 # ============================================================================
 # 台灣時區工具函數
 # ============================================================================
@@ -247,20 +244,8 @@ class AdminLoginRequest(BaseModel):
     admin_key: str
 
 class JoinRequest(BaseModel):
-    pid: str = Field(..., min_length=4, max_length=10)
-    nickname: str = Field(..., min_length=1, max_length=50)
-    
-    @validator('pid')
-    def validate_pid(cls, v):
-        if not re.match(r'^\d{3}[A-Z]$', v, re.IGNORECASE):
-            raise ValueError('PID 格式錯誤,應為: 3碼數字 + 1碼英文 (例: 123A)')
-        return v.upper()
-    
-    @validator('nickname')
-    def validate_nickname(cls, v):
-        if not re.match(r'^[a-zA-Z0-9_]+$', v):
-            raise ValueError('暱稱只能包含英文、數字和底線')
-        return v
+    pid: str = Field(..., min_length=1, max_length=50)
+    nickname: Optional[str] = Field(default=None, max_length=100)
 
 class AssessmentUpsert(BaseModel):
     mbti_raw: Optional[str] = None
@@ -289,12 +274,9 @@ def is_pid_allowed(pid: str, db: Session) -> bool:
 # ============================================================================
 # 認證端點
 # ============================================================================
-limiter = Limiter(key_func=get_remote_address, default_limits=["200/hour"])
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 @app.post("/api/auth/join")
-@limiter.limit("10/minute")  # 每分鐘最多 10 次登入嘗試
-def join(request: Request, body: JoinRequest, db: Session = Depends(get_db)):
+def join(body: JoinRequest, db: Session = Depends(get_db)):
     pid = (body.pid or "").strip()
     if not pid:
         raise HTTPException(status_code=422, detail="pid is required")
@@ -815,23 +797,4 @@ def admin_login(body: AdminLoginRequest, db: Session = Depends(get_db)):
         "ok": True,
         "token": admin_token,
         "message": "Admin login successful"
-    }
-
-@app.get("/api/security/check")
-def security_check():
-    """檢查系統安全配置"""
-    checks = {
-        "jwt_secret_set": bool(os.getenv("JWT_SECRET")) and os.getenv("JWT_SECRET") != "dev-secret-change-me",
-        "openai_key_set": bool(os.getenv("OPENAI_API_KEY")),
-        "admin_key_set": bool(os.getenv("ADMIN_KEY")),
-        "database_connected": True,  # 如果能執行到這裡就是連接成功
-        "cors_configured": len(settings.ALLOWED_ORIGINS) > 0,
-    }
-    
-    all_ok = all(checks.values())
-    
-    return {
-        "ok": all_ok,
-        "checks": checks,
-        "warnings": [k for k, v in checks.items() if not v]
     }
