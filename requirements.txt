@@ -69,7 +69,6 @@ pyasn1==0.6.1
 pycparser==2.22
 pydantic>=2.7,<3
 pydantic-settings>=2.10,<3
-pydantic_core==2.14.1
 pydub==0.25.1
 Pygments==2.19.2
 PyJWT==2.8.0
