@@ -626,7 +626,48 @@ def health():
         },
         "errors": {k: v["error"] for k, v in router_status.items() if v["error"]}
     }
+# 在 main.py 的 Health & Debug 區塊加入
 
+@app.get("/api/debug/rls-status")
+def check_rls_status(db: Session = Depends(get_db)):
+    """檢查 RLS 狀態和連線權限"""
+    try:
+        # 檢查當前角色
+        role_result = db.execute(text("SELECT current_user, current_setting('role', true)")).fetchone()
+        
+        # 檢查 RLS 狀態
+        rls_check = db.execute(text("""
+            SELECT 
+                schemaname,
+                tablename,
+                rowsecurity
+            FROM pg_tables 
+            WHERE schemaname = 'public'
+            ORDER BY tablename;
+        """)).fetchall()
+        
+        tables_status = [
+            {
+                "table": row[1],
+                "rls_enabled": row[2]
+            }
+            for row in rls_check
+        ]
+        
+        return {
+            "ok": True,
+            "current_user": role_result[0] if role_result else None,
+            "current_role": role_result[1] if role_result else None,
+            "tables": tables_status,
+            "note": "如果使用 service_role 或 postgres 用戶,RLS 會被自動繞過"
+        }
+        
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e)
+        }
+    
 @app.get("/api/debug/db-test")
 def db_test(db: Session = Depends(get_db)):
     try:
