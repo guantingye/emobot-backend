@@ -264,16 +264,15 @@ def generate_professional_summary(
         # 情緒強度的深度分析
         if emotion_intensity and top_emotion in emotion_intensity:
             intensity_value = emotion_intensity[top_emotion]
-            summary_parts.append(f"\n當你感受到這種情緒時,**強度指數達到 {round(intensity_value, 1)}/100**。", end="")
             
             if intensity_value > 75:
-                summary_parts.append("這是相當高的強度,意味著這些情緒深深地影響著你。你可能會感覺被情緒淹沒,難以抽離。這樣的感受是**真實且重要的**,不需要否認或壓抑。")
+                summary_parts.append(f"\n當你感受到這種情緒時,**強度指數達到 {round(intensity_value, 1)}/100**。這是相當高的強度,意味著這些情緒深深地影響著你。你可能會感覺被情緒淹沒,難以抽離。這樣的感受是**真實且重要的**,不需要否認或壓抑。")
             elif intensity_value > 50:
-                summary_parts.append("這是明顯且清晰的情緒體驗。你能清楚感受到它的存在,但還不至於失控。這個強度顯示你**既能感受情緒,也還保有一定的觀察距離**。")
+                summary_parts.append(f"\n當你感受到這種情緒時,**強度指數達到 {round(intensity_value, 1)}/100**。這是明顯且清晰的情緒體驗。你能清楚感受到它的存在,但還不至於失控。這個強度顯示你**既能感受情緒,也還保有一定的觀察距離**。")
             elif intensity_value > 30:
-                summary_parts.append("這是溫和而持續的情緒狀態。它像背景音樂一樣存在,不會太過強烈,但確實影響著你的**日常感受與決策**。")
+                summary_parts.append(f"\n當你感受到這種情緒時,**強度指數達到 {round(intensity_value, 1)}/100**。這是溫和而持續的情緒狀態。它像背景音樂一樣存在,不會太過強烈,但確實影響著你的**日常感受與決策**。")
             else:
-                summary_parts.append("這是較為柔和的情緒體驗。你展現出**良好的情緒調節能力**,能在感受情緒的同時保持內在平衡。")
+                summary_parts.append(f"\n當你感受到這種情緒時,**強度指數達到 {round(intensity_value, 1)}/100**。這是較為柔和的情緒體驗。你展現出**良好的情緒調節能力**,能在感受情緒的同時保持內在平衡。")
         
         # 根據主要情緒給予深度且溫暖的建議
         if top_emotion == "焦慮不安":
