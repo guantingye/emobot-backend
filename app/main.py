@@ -776,3 +776,39 @@ def get_mood_analysis(
         import traceback
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+
+# backend/app/main.py - 新增測驗結果 API 端點
+
+# 在現有的 main.py 中新增以下端點
+
+@app.get("/api/assessments/{assessment_id}")
+def get_assessment_by_id(
+    assessment_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    取得特定測驗記錄(需為該用戶的測驗)
+    """
+    a = db.query(Assessment)\
+        .filter(Assessment.id == assessment_id, Assessment.pid == user.pid)\
+        .first()
+    
+    if not a:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+    
+    return {
+        "ok": True,
+        "assessment": {
+            "id": a.id,
+            "pid": a.pid,
+            "mbti_raw": a.mbti_raw,
+            "mbti_encoded": a.mbti_encoded,
+            "step2_answers": a.step2_answers,
+            "step3_answers": a.step3_answers,
+            "step4_answers": a.step4_answers,
+            "is_retest": a.is_retest,
+            "created_at": format_tw_time(a.created_at),
+            "completed_at": format_tw_time(a.completed_at) if a.completed_at else None
+        }
+    }

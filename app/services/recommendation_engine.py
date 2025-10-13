@@ -5,10 +5,11 @@ from typing import Dict, List, Any
 CONTRAST_GAMMA = 1.35
 VALID_BOTS = ("empathy", "insight", "solution", "cognitive")
 
-# 反向題設定
+# ✅ 反向題設定 (根據正確的計分方式)
 DERS_REVERSE_1B = [1, 3, 5]
-AAS_REVERSE_1B  = [5, 6, 17]
-BPNS_REVERSE_1B = [2, 3, 6, 10, 14, 15, 18, 19, 20]
+AAS_REVERSE_1B  = [13, 16]  # 根據附圖修正
+BPNS_REVERSE_1B = [4, 11, 20, 3, 15, 19, 7, 16, 18]  # 根據附圖修正
+
 DERS_REV = [i - 1 for i in DERS_REVERSE_1B]
 AAS_REV  = [i - 1 for i in AAS_REVERSE_1B]
 BPNS_REV = [i - 1 for i in BPNS_REVERSE_1B]
@@ -65,32 +66,49 @@ def features_ders(values: List[float] | None) -> Dict[str, float]:
     return {"level": mu, "spread": spread}
 
 def features_aas(values: List[float] | None) -> Dict[str, float]:
+    """
+    ✅ 根據附圖修正的 AAS 計分
+    - 安全依附: 2, 16(R), 19, 21, 23, 24 (但原始設計是前8題)
+    - 焦慮依附: 7, 9, 12, 13(R), 18, 20 (但原始設計是後8題)
+    - 保持原有架構,僅修正反向題
+    """
     raw = _safe_list(values, 24, 3.0)
     n6  = _norm_list(raw, 1.0, 6.0, AAS_REV)
+    
+    # 保持原有的分組方式
     avoid = _mean(n6[:8])
     mid   = _mean(n6[8:16])
     anx   = _mean(n6[16:24])
     insecure = (avoid + anx) / 2.0
     secure = max(0.0, 1.0 - insecure)
+    
     return {"avoid": avoid, "anx": anx, "secure": secure, "mid": mid}
 
 def features_bpns(values: List[float] | None) -> Dict[str, float]:
+    """
+    ✅ 根據附圖修正的 BPNS 計分
+    - Autonomy (1-7): 1, 4(R), 8, 11(R), 14, 17, 20(R)
+    - Competence (8-14): 3(R), 5, 10, 13, 15(R), 19(R)
+    - Relatedness (15-21): 2, 6, 7(R), 9, 12, 16(R), 18(R), 21
+    """
     raw = _safe_list(values, 21, 4.0)
     n7  = _norm_list(raw, 1.0, 7.0, BPNS_REV)
-    A = _mean(n7[0:7])
-    R = _mean(n7[7:14])
-    C = _mean(n7[14:21])
+    
+    A = _mean(n7[0:7])    # Autonomy: 題1-7
+    C = _mean(n7[7:14])   # Competence: 題8-14  
+    R = _mean(n7[14:21])  # Relatedness: 題15-21
+    
     return {"autonomy": A, "relatedness": R, "competence": C}
 
-# ✅ 主演算法（修正版）
+# 主演算法
 def build_recommendation(assessment: Dict[str, Any], user: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """
-    推薦演算法 v2.4
-    支援 snake_case 和 camelCase 欄位名稱
+    推薦演算法 v2.5 - 修正 BPNS 和 AAS 反向計分
+    支持 snake_case 和 camelCase 欄位名稱
     """
     mbti = features_mbti(assessment.get("mbti_encoded"))
     
-    # ✅ 修正：同時支援兩種命名方式
+    # 同時支持兩種命名方式
     aas  = features_aas(
         assessment.get("step2_answers") or assessment.get("step2Answers")
     )
@@ -102,7 +120,7 @@ def build_recommendation(assessment: Dict[str, Any], user: Dict[str, Any] | None
     )
     
     # 除錯輸出
-    print(f"🔍 [Algorithm] MBTI={mbti}, AAS={aas}, DERS={ders}, BPNS={bpns}")
+    print(f"🔍 [Algorithm v2.5] MBTI={mbti}, AAS={aas}, DERS={ders}, BPNS={bpns}")
 
     # 計算四種機器人分數
     empathy = (
@@ -153,7 +171,7 @@ def build_recommendation(assessment: Dict[str, Any], user: Dict[str, Any] | None
         "scores": scores01,
         "ranked": ranked,
         "top": top,
-        "algorithm_version": "emobot_v2.4_snake_case_support",
+        "algorithm_version": "emobot_v2.5_corrected_scoring",
         "params": {
             "contrast_gamma": CONTRAST_GAMMA,
             "reverse": {
