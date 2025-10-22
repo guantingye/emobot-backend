@@ -434,6 +434,59 @@ async def get_chat_stats(
     except Exception as e:
         logger.error(f"Failed to fetch stats: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch stats")
+    
+@router.get("/session-history")
+async def get_session_history(
+    session_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    取得特定 session 的對話歷史
+    用於頁面重新載入時恢復對話
+    """
+    try:
+        print(f"📚 Loading session history: session_id={session_id}, pid={user.pid}")
+        
+        # 查詢該 session 的所有訊息
+        messages = (
+            db.query(ChatMessage)
+            .filter(
+                ChatMessage.pid == user.pid,
+                ChatMessage.meta['session_id'].astext == session_id
+            )
+            .order_by(ChatMessage.created_at.asc())
+            .all()
+        )
+        
+        result = []
+        for msg in messages:
+            result.append({
+                "id": msg.id,
+                "role": msg.role,
+                "content": msg.content,
+                "bot_type": msg.bot_type,
+                "timestamp": msg.created_at.isoformat(),
+                "sender": "user" if msg.role == "user" else "ai"
+            })
+        
+        print(f"✅ Loaded {len(result)} messages for session {session_id}")
+        
+        return {
+            "ok": True,
+            "messages": result,
+            "count": len(result),
+            "session_id": session_id
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to fetch session history: {e}")
+        return {
+            "ok": False,
+            "messages": [],
+            "count": 0,
+            "error": str(e)
+        }
 
 @router.get("/first-time-check/{bot_type}")
 async def check_first_time_chat(
