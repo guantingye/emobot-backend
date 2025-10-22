@@ -448,16 +448,21 @@ async def get_session_history(
     try:
         print(f"📚 Loading session history: session_id={session_id}, pid={user.pid}")
         
-        # 查詢該 session 的所有訊息
-        messages = (
+        # 載入該用戶的所有訊息
+        all_messages = (
             db.query(ChatMessage)
-            .filter(
-                ChatMessage.pid == user.pid,
-                ChatMessage.meta['session_id'].astext == session_id
-            )
+            .filter(ChatMessage.pid == user.pid)
             .order_by(ChatMessage.created_at.asc())
             .all()
         )
+        
+        # 在 Python 中過濾出符合 session_id 的訊息
+        messages = []
+        for msg in all_messages:
+            if msg.meta and isinstance(msg.meta, dict):
+                msg_session_id = msg.meta.get('session_id')
+                if msg_session_id == session_id:
+                    messages.append(msg)
         
         result = []
         for msg in messages:
@@ -480,7 +485,9 @@ async def get_session_history(
         }
         
     except Exception as e:
-        logger.error(f"Failed to fetch session history: {e}")
+        logger.error(f"❌ Failed to fetch session history: {e}")
+        import traceback
+        traceback.print_exc()
         return {
             "ok": False,
             "messages": [],
